@@ -5,7 +5,7 @@
   
 <img height="500" alt="image" src="https://github.com/user-attachments/assets/0dac6a9f-32a8-4b05-b6a1-b59fc3762f51" />
 
-PathShield is an RF awareness tool for M5StickC Plus 1.1 and Plus 2. It uses BLE/WiFi scanning to detect nearby devices, alerting on those following you.
+PathShield is an RF awareness tool for M5StickC Plus 1.1, Plus 2, and StickS3. It uses BLE/WiFi scanning to detect nearby devices, alerting on those following you.
 </div>
 
 
@@ -38,7 +38,7 @@ PathShield is an RF awareness tool for M5StickC Plus 1.1 and Plus 2. It uses BLE
 - **Tracker Detection**: AirTag, Tile, SmartTag, Chipolo, Google FMDN identified by protocol
 - **Known Device Ring Buffer**: Stable-RSSI devices promoted to compact storage, freeing active slots
 - **24,500+ MAC Database**: Offline manufacturer identification
-- **Hardware Adaptive**: Auto-detects CPlus2 PSRAM for 2x device tracking capacity
+- **Hardware Adaptive**: Auto-detects PSRAM (Plus 2, StickS3) for 2x device tracking capacity
 - **Dynamic Memory Scaling**: Device limits scale to available heap at boot
 
 ![image](https://github.com/user-attachments/assets/fade8692-0052-4e00-b244-b068992c8772)
@@ -55,7 +55,7 @@ PathShield is an RF awareness tool for M5StickC Plus 1.1 and Plus 2. It uses BLE
 [Install PathShield](https://lukeswitz.github.io/PathShield/)
 
 1. Open link in Chrome, Edge, or Opera (not Safari/Firefox)
-2. Select your hardware (Plus 1.1 or Plus 2)
+2. Select your hardware (Plus 1.1, Plus 2, or StickS3)
 3. Connect device via USB-C
 4. Click "Deploy Firmware"
 5. Select serial port, wait ~2 minutes
@@ -72,7 +72,12 @@ PathShield is an RF awareness tool for M5StickC Plus 1.1 and Plus 2. It uses BLE
 2. PSRAM: **Enabled**
 3. Partition: **8M with spiffs (3MB APP/1.5MB SPIFFS)**
 
-Both require M5Unified and NimBLE-Arduino libraries.
+**M5StickS3:**
+1. Board: **M5StickS3**
+2. PSRAM: **OPI PSRAM** (default)
+3. Partition: **8M with spiffs (3MB APP/1.5MB SPIFFS)** (default)
+
+All variants require M5Unified and NimBLE-Arduino libraries. The M5StickS3 board definition is provided by the same M5Stack board package (`m5stack:esp32`, v3.3.8+) used for the other boards.
 
 
 ## Controls
@@ -324,14 +329,17 @@ Normal on first flash. The device formats SPIFFS automatically (~30 seconds), th
 
 ## Hardware
 
-| | M5StickC Plus 1.1 | M5StickC Plus 2 |
-|---|---|---|
-| **SoC** | ESP32-PICO-D4 | ESP32-PICO-V3-02 |
-| **Flash** | 4MB | 8MB |
-| **PSRAM** | None | 2MB |
-| **Device Limits** | ~50 BLE, ~50 WiFi | ~70 BLE, ~50 WiFi |
+| | M5StickC Plus 1.1 | M5StickC Plus 2 | M5StickS3 |
+|---|---|---|---|
+| **SoC** | ESP32-PICO-D4 | ESP32-PICO-V3-02 | ESP32-S3-PICO-1-N8R8 |
+| **Flash** | 4MB | 8MB | 8MB |
+| **PSRAM** | None | 2MB | 8MB (Octal) |
+| **Device Limits** | ~50 BLE, ~50 WiFi | ~70 BLE, ~50 WiFi | ~70 BLE, ~50 WiFi |
 
 Separate firmware builds required per board (different PSRAM/partition configs).
+
+> [!NOTE]
+> StickS3 uses the same PSRAM-scaled device limits as Plus 2. Its 8MB of PSRAM is well above what's currently used, so those caps can be raised in a future update once behavior is confirmed on hardware.
 
 ## Known Limitations
 
