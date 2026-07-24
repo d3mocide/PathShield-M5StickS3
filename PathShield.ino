@@ -10,18 +10,15 @@
 #define SCREEN_HEIGHT 135
 #define DEFAULT_SCREEN_TIMEOUT 30000
 
-// Memory constants — scaled at runtime based on free heap
-#define MIN_DEVICES 25
+// M5StickS3 always has 8MB PSRAM, so device limits are fixed at boot.
 #define MAX_DEVICES_CAP 70
-#define MIN_WIFI_DEVICES 25
 #define MAX_WIFI_DEVICES_CAP 50
 #define DETECTION_WINDOW 300
 #define IDLE_TIMEOUT 30000
 #define MAX_TIMESTAMPS 20
 
-// Runtime device limits (set dynamically at boot based on free heap)
-int maxDevices = MIN_DEVICES;
-int maxWifiDevices = MIN_WIFI_DEVICES;
+int maxDevices = MAX_DEVICES_CAP;
+int maxWifiDevices = MAX_WIFI_DEVICES_CAP;
 bool hasPsram = false;
 
 #define BLUE_GREY 0x5D9B
@@ -42,8 +39,6 @@ bool hasPsram = false;
 #define EPSILON_CONNECTED_GAP 180
 #define MIN_RSSI_RANGE 12
 #define RSSI_FLOOR -80
-
-#define ESTIMATED_APP_RESERVE_KB 40
 
 const int MEMORY_CRITICAL = 50;
 const int MEMORY_WARNING = 80;
@@ -74,6 +69,20 @@ unsigned long lastMenuRender = 0;
 bool alertActive = false;
 unsigned long alertStartTime = 0;
 const unsigned long ALERT_DURATION = 5000;
+
+// Alert handoff from scanTask (Core 0) to loop() (Core 1).
+// All M5.Display / M5.update() calls must happen on Core 1 only — scanTask
+// never touches display or button hardware directly, it just deposits data here.
+struct PendingAlertInfo {
+  bool isSpecial;
+  char name[21];
+  char mac[18];
+  float score;
+  uint8_t trackerType;
+};
+PendingAlertInfo pendingAlertInfo;
+volatile bool alertPending = false;
+volatile bool showingAlert = false;
 
 struct WiFiDeviceInfo {
   char ssid[33];
@@ -163,7 +172,6 @@ NimBLEScan *pBLEScan;
 int scrollIndex = 0;
 
 // Known device ring buffer — compact storage for stable-RSSI devices
-#define MIN_KNOWN 40
 #define MAX_KNOWN_CAP 80
 #define KNOWN_PROMOTE_COUNT 8
 #define KNOWN_RSSI_DRIFT 20
@@ -178,7 +186,7 @@ struct KnownDevice {
 
 KnownDevice *knownDevices = NULL;
 int knownDeviceCount = 0;
-int maxKnownDevices = MIN_KNOWN;
+int maxKnownDevices = MAX_KNOWN_CAP;
 
 SemaphoreHandle_t deviceMutex = NULL;
 TaskHandle_t scanTaskHandle = NULL;
@@ -1608,7 +1616,8 @@ void scanTask(void *parameter) {
   bool localScanningWiFi = true;
 
   while (scanTaskRunning) {
-    if (paused) {
+    if (paused || showingAlert) {
+      esp_task_wdt_reset();
       vTaskDelay(100 / portTICK_PERIOD_MS);
       continue;
     }
@@ -1707,7 +1716,23 @@ void scanTask(void *parameter) {
           }
 
           if (deviceIndex > 0) {
-            alertUser(isSpecial, alertName, alertAddr, alertScore, alertTrackerType);
+            pendingAlertInfo.isSpecial = isSpecial;
+            strncpy(pendingAlertInfo.name, alertName, 20);
+            pendingAlertInfo.name[20] = '\0';
+            strncpy(pendingAlertInfo.mac, alertAddr, 17);
+            pendingAlertInfo.mac[17] = '\0';
+            pendingAlertInfo.score = alertScore;
+            pendingAlertInfo.trackerType = alertTrackerType;
+            showingAlert = true;
+            alertPending = true;
+
+            // Hold here until loop() (Core 1) has shown the alert and the user
+            // dismissed it. Keep feeding the watchdog — this wait is expected
+            // to last as long as the user takes to notice the alert.
+            while (showingAlert && scanTaskRunning) {
+              esp_task_wdt_reset();
+              vTaskDelay(50 / portTICK_PERIOD_MS);
+            }
           }
         }
 
@@ -1723,6 +1748,7 @@ void scanTask(void *parameter) {
       xSemaphoreGive(deviceMutex);
     }
 
+    esp_task_wdt_reset();
     vTaskDelay(50 / portTICK_PERIOD_MS);
   }
 
@@ -1731,8 +1757,6 @@ void scanTask(void *parameter) {
 }
 
 void setup() {
-  esp_task_wdt_deinit();
-
   Serial.begin(115200);
   delay(1000);
   Serial.println("Starting setup...");
@@ -1774,39 +1798,34 @@ void setup() {
   WiFi.disconnect();
   Serial.printf("Heap after WiFi init: %dKB\n", ESP.getFreeHeap() / 1024);
 
-  // Detect PSRAM (CPlus2 has 2MB, CPlus1.1 has none)
+  // M5StickS3 always ships with 8MB OPI PSRAM. If it's missing, the board's
+  // PSRAM setting wasn't enabled correctly at build time — fail loudly
+  // instead of silently degrading to a reduced-capacity heap-only mode.
   hasPsram = psramFound();
-
-  // Dynamic sizing: PSRAM boards get full caps, heap-only boards scale to fit
-  if (hasPsram) {
-    maxDevices = MAX_DEVICES_CAP;
-    maxWifiDevices = MAX_WIFI_DEVICES_CAP;
-    maxKnownDevices = MAX_KNOWN_CAP;
-    Serial.printf("PSRAM detected: %dKB — device limits: %d BLE, %d WiFi, %d Known\n",
-                  ESP.getPsramSize() / 1024, maxDevices, maxWifiDevices, maxKnownDevices);
-  } else {
-    size_t freeHeap = ESP.getFreeHeap();
-    size_t reserveBytes = ESTIMATED_APP_RESERVE_KB * 1024;
-    size_t availableBytes = (freeHeap > reserveBytes) ? freeHeap - reserveBytes : 0;
-    size_t perSlot = sizeof(DeviceInfo) + sizeof(WiFiDeviceInfo) + sizeof(KnownDevice) * 2;
-    int slots = availableBytes / perSlot;
-    maxDevices = constrain(slots, MIN_DEVICES, MAX_DEVICES_CAP);
-    maxWifiDevices = constrain(slots, MIN_WIFI_DEVICES, MAX_WIFI_DEVICES_CAP);
-    maxKnownDevices = constrain(slots * 2, MIN_KNOWN, MAX_KNOWN_CAP);
-    Serial.printf("No PSRAM — heap: %dKB — device limits: %d BLE, %d WiFi, %d Known\n",
-                  freeHeap / 1024, maxDevices, maxWifiDevices, maxKnownDevices);
+  if (!hasPsram) {
+    Serial.println("FATAL: No PSRAM detected. Enable 'OPI PSRAM' in board settings and reflash.");
+    M5.Display.fillScreen(RED);
+    M5.Display.setTextSize(2);
+    M5.Display.setTextColor(WHITE);
+    M5.Display.setCursor(10, 40);
+    M5.Display.print("NO PSRAM");
+    M5.Display.setTextSize(1);
+    M5.Display.setCursor(10, 70);
+    M5.Display.print("Enable OPI PSRAM in board");
+    M5.Display.setCursor(10, 82);
+    M5.Display.print("settings, then reflash");
+    while (1) delay(1000);
   }
 
-  // Allocate device arrays (PSRAM if available, else internal heap)
-  if (hasPsram) {
-    trackedDevices = (DeviceInfo *)ps_malloc(maxDevices * sizeof(DeviceInfo));
-    wifiDevices = (WiFiDeviceInfo *)ps_malloc(maxWifiDevices * sizeof(WiFiDeviceInfo));
-    knownDevices = (KnownDevice *)ps_malloc(maxKnownDevices * sizeof(KnownDevice));
-  } else {
-    trackedDevices = (DeviceInfo *)malloc(maxDevices * sizeof(DeviceInfo));
-    wifiDevices = (WiFiDeviceInfo *)malloc(maxWifiDevices * sizeof(WiFiDeviceInfo));
-    knownDevices = (KnownDevice *)malloc(maxKnownDevices * sizeof(KnownDevice));
-  }
+  maxDevices = MAX_DEVICES_CAP;
+  maxWifiDevices = MAX_WIFI_DEVICES_CAP;
+  maxKnownDevices = MAX_KNOWN_CAP;
+  Serial.printf("PSRAM detected: %dKB — device limits: %d BLE, %d WiFi, %d Known\n",
+                ESP.getPsramSize() / 1024, maxDevices, maxWifiDevices, maxKnownDevices);
+
+  trackedDevices = (DeviceInfo *)ps_malloc(maxDevices * sizeof(DeviceInfo));
+  wifiDevices = (WiFiDeviceInfo *)ps_malloc(maxWifiDevices * sizeof(WiFiDeviceInfo));
+  knownDevices = (KnownDevice *)ps_malloc(maxKnownDevices * sizeof(KnownDevice));
   memset(trackedDevices, 0, maxDevices * sizeof(DeviceInfo));
   memset(wifiDevices, 0, maxWifiDevices * sizeof(WiFiDeviceInfo));
   memset(knownDevices, 0, maxKnownDevices * sizeof(KnownDevice));
@@ -1929,13 +1948,29 @@ void setup() {
   xTaskCreatePinnedToCore(
     scanTask,
     "ScanTask",
-    hasPsram ? 16384 : 12288,
+    16384,
     NULL,
     1,
     &scanTaskHandle,
     0
   );
   Serial.println("Scanning task started on Core 0");
+
+  // Watchdog covers scanTask only (idle_core_mask=0 — don't watch idle tasks,
+  // that's what made the old default WDT fire spuriously and got it disabled
+  // entirely). A hung BLE/WiFi call now reboots the device instead of
+  // freezing it forever; scanTask feeds it every loop iteration and while
+  // legitimately waiting on `paused` or an on-screen alert.
+  esp_task_wdt_config_t twdtConfig = {
+    .timeout_ms = 20000,
+    .idle_core_mask = 0,
+    .trigger_panic = true
+  };
+  if (esp_task_wdt_init(&twdtConfig) == ESP_ERR_INVALID_STATE) {
+    esp_task_wdt_reconfigure(&twdtConfig);
+  }
+  esp_task_wdt_add(scanTaskHandle);
+  Serial.println("Task watchdog armed on scanTask (20s timeout)");
 
   delay(100);
 
@@ -1954,6 +1989,18 @@ void loop() {
   const unsigned long MEMORY_CHECK_INTERVAL = 5000;
 
   M5.update();
+
+  // Tracker alert deposited by scanTask (Core 0) — render and wait for
+  // dismissal here on Core 1, the only task allowed to touch the display/buttons.
+  if (alertPending) {
+    PendingAlertInfo local = pendingAlertInfo;
+    alertPending = false;
+    alertUser(local.isSpecial, local.name, local.mac, local.score, local.trackerType);
+    showingAlert = false;
+    forceDisplayRefresh();
+    lastDisplayUpdate = currentMillis;
+    return;
+  }
 
   if (currentMillis - lastMemoryCheck > MEMORY_CHECK_INTERVAL) {
     lastMemoryCheck = currentMillis;
