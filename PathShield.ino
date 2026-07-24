@@ -1358,31 +1358,6 @@ void toggleBrightness() {
   saveUserPreferences();
 }
 
-void saveDeviceData() {
-  if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(500)) != pdTRUE) {
-    return;
-  }
-
-  File file = SPIFFS.open("/devices.txt", FILE_WRITE);
-  if (!file) {
-    xSemaphoreGive(deviceMutex);
-    return;
-  }
-
-  for (int i = 0; i < deviceIndex; i++) {
-    file.print(trackedDevices[i].address);
-    file.print(",");
-    file.print(trackedDevices[i].lastSeen);
-    file.print(",");
-    file.print(trackedDevices[i].totalCount);
-    file.print(",");
-    file.println(trackedDevices[i].persistenceScore);
-  }
-
-  file.close();
-  xSemaphoreGive(deviceMutex);
-}
-
 void clearDevices() {
   if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(500)) != pdTRUE) {
     return;
@@ -1390,13 +1365,11 @@ void clearDevices() {
 
   deviceIndex = 0;
   scrollIndex = 0;
-  SPIFFS.remove("/devices.txt");
 
   xSemaphoreGive(deviceMutex);
 }
 
 void shutdownDevice() {
-  saveDeviceData();
   M5.Display.fillScreen(RED);
   M5.Display.setTextSize(2);
   M5.Display.setTextColor(WHITE);
@@ -1595,8 +1568,14 @@ void scanTask(void *parameter) {
       NimBLEScanResults foundDevices = pBLEScan->getResults(2000, false);
 
       {
-        bool newTrackerFound = false;
-        int alertDeviceIdx = -1;
+        // A single scan batch can surface several distinct new trackers at
+        // once (e.g. walking past a shelf of AirTags). Queue every one of
+        // them here instead of only ever showing the last — trackedDevices[0]
+        // is only *this* device right when trackDevice() returns true for it
+        // (it just moved itself there), so snapshot immediately or a later
+        // device in the same batch overwrites it and the alert is lost.
+        PendingAlertInfo alertQueue[8];
+        int queuedAlerts = 0;
 
         if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
           int count = foundDevices.getCount();
@@ -1612,20 +1591,27 @@ void scanTask(void *parameter) {
 
             if (!isAllowlistedMac(macAddr)) {
               uint8_t tType = detectTrackerType(*device);
+              bool isNewTracker = false;
 
               // Known trackers bypass the known-device buffer entirely
               if (tType != TRACKER_NONE) {
-                if (trackDevice(macAddr, device->getRSSI(), currentTime,
-                                device->getName().c_str(), tType)) {
-                  newTrackerFound = true;
-                  alertDeviceIdx = 0;
-                }
+                isNewTracker = trackDevice(macAddr, device->getRSSI(), currentTime,
+                                           device->getName().c_str(), tType);
               } else if (!handleKnownDevice(macAddr, device->getRSSI(), currentTime)) {
-                if (trackDevice(macAddr, device->getRSSI(), currentTime,
-                                device->getName().c_str())) {
-                  newTrackerFound = true;
-                  alertDeviceIdx = 0;
-                }
+                isNewTracker = trackDevice(macAddr, device->getRSSI(), currentTime,
+                                           device->getName().c_str());
+              }
+
+              if (isNewTracker && deviceIndex > 0 && queuedAlerts < 8) {
+                DeviceInfo &d = trackedDevices[0];
+                alertQueue[queuedAlerts].isSpecial = d.isSpecial;
+                strncpy(alertQueue[queuedAlerts].name, d.name, 20);
+                alertQueue[queuedAlerts].name[20] = '\0';
+                strncpy(alertQueue[queuedAlerts].mac, d.address, 17);
+                alertQueue[queuedAlerts].mac[17] = '\0';
+                alertQueue[queuedAlerts].score = d.persistenceScore;
+                alertQueue[queuedAlerts].trackerType = d.trackerType;
+                queuedAlerts++;
               }
             }
             vTaskDelay(1 / portTICK_PERIOD_MS);
@@ -1633,44 +1619,18 @@ void scanTask(void *parameter) {
           xSemaphoreGive(deviceMutex);
         }
 
-        if (newTrackerFound && alertDeviceIdx >= 0) {
-          bool isSpecial = false;
-          char alertName[21];
-          char alertAddr[18];
-          float alertScore = 0.0f;
-          uint8_t alertTrackerType = TRACKER_NONE;
+        // Show every queued alert in turn, outside the mutex.
+        for (int q = 0; q < queuedAlerts; q++) {
+          pendingAlertInfo = alertQueue[q];
+          showingAlert = true;
+          alertPending = true;
 
-          if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-            if (deviceIndex > 0) {
-              isSpecial = trackedDevices[0].isSpecial;
-              strncpy(alertName, trackedDevices[0].name, 20);
-              alertName[20] = '\0';
-              strncpy(alertAddr, trackedDevices[0].address, 17);
-              alertAddr[17] = '\0';
-              alertScore = trackedDevices[0].persistenceScore;
-              alertTrackerType = trackedDevices[0].trackerType;
-            }
-            xSemaphoreGive(deviceMutex);
-          }
-
-          if (deviceIndex > 0) {
-            pendingAlertInfo.isSpecial = isSpecial;
-            strncpy(pendingAlertInfo.name, alertName, 20);
-            pendingAlertInfo.name[20] = '\0';
-            strncpy(pendingAlertInfo.mac, alertAddr, 17);
-            pendingAlertInfo.mac[17] = '\0';
-            pendingAlertInfo.score = alertScore;
-            pendingAlertInfo.trackerType = alertTrackerType;
-            showingAlert = true;
-            alertPending = true;
-
-            // Hold here until loop() (Core 1) has shown the alert and the user
-            // dismissed it. Keep feeding the watchdog — this wait is expected
-            // to last as long as the user takes to notice the alert.
-            while (showingAlert && scanTaskRunning) {
-              esp_task_wdt_reset();
-              vTaskDelay(50 / portTICK_PERIOD_MS);
-            }
+          // Hold here until loop() (Core 1) has shown the alert and the user
+          // dismissed it. Keep feeding the watchdog — this wait is expected
+          // to last as long as the user takes to notice the alert.
+          while (showingAlert && scanTaskRunning) {
+            esp_task_wdt_reset();
+            vTaskDelay(50 / portTICK_PERIOD_MS);
           }
         }
 
@@ -2094,10 +2054,4 @@ void loop() {
   }
 
   vTaskDelay(50 / portTICK_PERIOD_MS);
-
-  static unsigned long lastSaveTime = 0;
-  if (currentMillis - lastSaveTime > 60000) {
-    saveDeviceData();
-    lastSaveTime = currentMillis;
-  }
 }
