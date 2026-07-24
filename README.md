@@ -5,11 +5,14 @@
   
 <img height="500" alt="image" src="https://github.com/user-attachments/assets/0dac6a9f-32a8-4b05-b6a1-b59fc3762f51" />
 
-PathShield is an RF awareness tool for M5StickC Plus 1.1, Plus 2, and StickS3. It uses BLE/WiFi scanning to detect nearby devices, alerting on those following you.
+PathShield is an RF awareness tool for the M5StickS3. It uses BLE/WiFi scanning to detect nearby devices, alerting on those following you.
 </div>
 
 
 ---
+
+> [!NOTE]
+> This fork targets the **M5StickS3 exclusively** — the code, web flasher, and docs here assume that hardware and take on breaking changes freely. For M5StickC Plus 1.1 / Plus 2, use the upstream project: [lukeswitz/PathShield](https://github.com/lukeswitz/PathShield).
 
 > [!CAUTION]
 > **ETHICAL USE ONLY**
@@ -38,8 +41,7 @@ PathShield is an RF awareness tool for M5StickC Plus 1.1, Plus 2, and StickS3. I
 - **Tracker Detection**: AirTag, Tile, SmartTag, Chipolo, Google FMDN identified by protocol
 - **Known Device Ring Buffer**: Stable-RSSI devices promoted to compact storage, freeing active slots
 - **24,500+ MAC Database**: Offline manufacturer identification
-- **Hardware Adaptive**: Auto-detects PSRAM (Plus 2, StickS3) for 2x device tracking capacity
-- **Dynamic Memory Scaling**: Device limits scale to available heap at boot
+- **PSRAM-Backed Tracking**: Uses the StickS3's 8MB PSRAM for a large device-tracking capacity
 
 ![image](https://github.com/user-attachments/assets/fade8692-0052-4e00-b244-b068992c8772)
 
@@ -52,32 +54,24 @@ PathShield is an RF awareness tool for M5StickC Plus 1.1, Plus 2, and StickS3. I
 ## Installation
 
 ### Web Flasher
-[Install PathShield](https://lukeswitz.github.io/PathShield/)
+[Install PathShield](https://d3mocide.github.io/pathshield-m5sticks3/)
 
 1. Open link in Chrome, Edge, or Opera (not Safari/Firefox)
-2. Select your hardware (Plus 1.1, Plus 2, or StickS3)
-3. Connect device via USB-C
-4. Click "Deploy Firmware"
-5. Select serial port, wait ~2 minutes
+2. Connect M5StickS3 via USB-C
+3. Click "Deploy Firmware"
+4. Select serial port, wait ~2 minutes
 
 ### From Source (Arduino IDE)
 
-**M5StickC Plus 1.1:**
-1. Board: **M5StickCPlus**
-2. PSRAM: **Disabled**
-3. Partition: **Huge APP (3MB No OTA/1MB SPIFFS)**
-
-**M5StickC Plus 2:**
-1. Board: **M5StickCPlus2**
-2. PSRAM: **Enabled**
-3. Partition: **8M with spiffs (3MB APP/1.5MB SPIFFS)**
-
 **M5StickS3:**
-1. Board: **M5StickS3**
-2. PSRAM: **OPI PSRAM** (default)
+1. Board package: `m5stack:esp32` (v3.3.8+), board **M5StickS3**
+2. PSRAM: **OPI PSRAM** (default) — required, the firmware halts on boot if it isn't enabled
 3. Partition: **8M with spiffs (3MB APP/1.5MB SPIFFS)** (default)
 
-All variants require M5Unified and NimBLE-Arduino libraries. The M5StickS3 board definition is provided by the same M5Stack board package (`m5stack:esp32`, v3.3.8+) used for the other boards.
+**Library versions:**
+- **M5Unified**: `>= 0.2.14` required, `0.2.17+` recommended — earlier versions have a StickS3-specific bug where `M5.Power.powerOff()` powers off and then immediately reboots instead of staying off
+- **M5GFX**: latest (pulled in automatically as an M5Unified dependency)
+- **NimBLE-Arduino**: latest
 
 
 ## Controls
@@ -85,16 +79,24 @@ All variants require M5Unified and NimBLE-Arduino libraries. The M5StickS3 board
 ### Normal Scanning Mode
 ```
 Button A:   Pause scanning
-Button B:   Toggle name filter
+Button B:   Cycle filter (Show All -> Named Only -> Alerts Only)
 A+B (hold): Settings menu
 ```
 
 ### Paused 
 ```
-Button A:      Scroll up
+Button A:      Scroll up (tap)
+Button A hold: Allowlist the topmost visible device (hold 1 second)
 Button B:      Scroll down (tap)
 Button B hold: Resume (hold 1 second)
 ```
+
+Holding Button A allowlists whichever device is currently at the top of the
+screen — it disappears from the list immediately and won't be tracked again.
+Useful for killing a false positive (your own phone, earbuds, car) on the
+spot, without editing `allowlistMacs[]` and reflashing. Only works on BLE
+devices (not the WiFi list), and matches the exact MAC shown, not the whole
+manufacturer. The allowlist persists across reboots (`/allowlist.txt`).
 
 ### Settings Menu
 ```
@@ -104,10 +106,12 @@ A+B hold:  Exit menu
 ```
 
 **Available Settings:**
-- **Brightness**: Low/High (saves battery on low brightness)
+- **Toggle Brightness**: Low/High (saves battery on low brightness)
+- **Set Screen Timeout**: How long before screen turns off when idle (10-300 seconds)
+- **Alert Mode**: Cycles Loud+Sound / Loud+Mute / Quiet+Sound / Quiet+Mute. Quiet mode skips the full-screen red/blue strobe (a small bordered indicator instead) and doesn't force max brightness — useful when a flashing screen would draw the wrong kind of attention. Sound plays a short double-beep on alert via the StickS3's onboard speaker.
+- **Export Incident**: Writes a timestamped snapshot of currently-alerting devices to `/incidents.txt` on SPIFFS. Deliberate/on-demand only — nothing is logged automatically. Retrieve it by opening Serial Monitor (115200 baud) and sending `d`.
 - **Clear Devices**: Clears all tracked devices from memory
-- **Display Timeout**: How long before screen turns off when idle (10-300 seconds)
-- **Shutdown Device**: Power off the device
+- **Shutdown**: Power off the device
 
 ## Display Guide
 
@@ -123,6 +127,8 @@ Each device shows:
 Device Name (BLE) or SSID (WiFi)
 Manufacturer (identified from MAC)
 Detection Count + Signal Strength (RSSI)
+  -- or, once flagged as a suspected tracker --
+Alert Score + Duration Since First Seen (e.g. "!0.82 3m")
 ```
 
 ### Color Codes
@@ -135,8 +141,8 @@ GREEN   = Scan active, status messages
 ```
 
 ### Filter Mode
-- Press **Button B** to toggle between "Show All" (all devices) and "Named Only" (only named devices)
-- Useful for cutting through noise when there are many unnamed devices
+- Press **Button B** to cycle: "Show All" -> "Named Only" (hides unnamed/noise devices) -> "Alerts Only" (only currently-flagged/suspected trackers) -> back to "Show All"
+- Useful for cutting through noise when there are many unnamed devices, or jumping straight to what's currently flagged
 
 ### Footer
 - **Page counter**: Shows which page you're viewing (e.g., "1-3/23")
@@ -297,7 +303,12 @@ M5.Display.drawFastHLine(0, 0, SCREEN_WIDTH, MAGENTA);  // Border color
 - Press **Button B** to show only named devices
 - Hides random MAC addresses and noise
 
-**Persistent false positives: Add to allowlist**
+**Fastest fix: Allowlist it in the field**
+1. Press **Button A** to pause, scroll until the device is at the top
+2. Hold **Button A** for 1 second — it's gone and won't be tracked again
+3. No reflash needed; persists across reboots
+
+**Permanent, compiled-in allowlist (for devices you always want ignored)**
 1. Note the MAC address from the display
 2. Add to `allowlistMacs[]` in PathShield.ino
 3. Re-upload and restart
@@ -314,7 +325,7 @@ Hold Button B for 1 full second (not just tap).
 
 ### Device Crashes / Resets
 
-Watch the memory bar on screen — red means critically low. Device limits scale dynamically at boot based on available heap.
+Watch the memory bar on screen — red means critically low. If a BLE or WiFi scan genuinely hangs, a task watchdog reboots the device automatically after ~20 seconds rather than leaving it frozen.
 
 ### SPIFFS Format on First Boot
 
@@ -329,17 +340,15 @@ Normal on first flash. The device formats SPIFFS automatically (~30 seconds), th
 
 ## Hardware
 
-| | M5StickC Plus 1.1 | M5StickC Plus 2 | M5StickS3 |
-|---|---|---|---|
-| **SoC** | ESP32-PICO-D4 | ESP32-PICO-V3-02 | ESP32-S3-PICO-1-N8R8 |
-| **Flash** | 4MB | 8MB | 8MB |
-| **PSRAM** | None | 2MB | 8MB (Octal) |
-| **Device Limits** | ~50 BLE, ~50 WiFi | ~70 BLE, ~50 WiFi | ~70 BLE, ~50 WiFi |
-
-Separate firmware builds required per board (different PSRAM/partition configs).
+| | M5StickS3 |
+|---|---|
+| **SoC** | ESP32-S3-PICO-1-N8R8 |
+| **Flash** | 8MB |
+| **PSRAM** | 8MB (Octal) |
+| **Device Limits** | ~70 BLE, ~50 WiFi |
 
 > [!NOTE]
-> StickS3 uses the same PSRAM-scaled device limits as Plus 2. Its 8MB of PSRAM is well above what's currently used, so those caps can be raised in a future update once behavior is confirmed on hardware.
+> Device limits are fixed at boot, sized for the StickS3's 8MB PSRAM. That's well above what's currently used, so the caps in `PathShield.ino` (`MAX_DEVICES_CAP`, `MAX_WIFI_DEVICES_CAP`, `MAX_KNOWN_CAP`) can be raised in a future update once headroom is confirmed on hardware.
 
 ## Known Limitations
 
@@ -363,6 +372,8 @@ unethical use. Review local regulations before deployment.
 ## Contributing
 
 Issues and pull requests welcome. Test thoroughly before submitting.
+
+See [ROADMAP.md](ROADMAP.md) for planned UX/product enhancements, phased by impact.
 
 ## Support
 

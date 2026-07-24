@@ -10,18 +10,15 @@
 #define SCREEN_HEIGHT 135
 #define DEFAULT_SCREEN_TIMEOUT 30000
 
-// Memory constants — scaled at runtime based on free heap
-#define MIN_DEVICES 25
+// M5StickS3 always has 8MB PSRAM, so device limits are fixed at boot.
 #define MAX_DEVICES_CAP 70
-#define MIN_WIFI_DEVICES 25
 #define MAX_WIFI_DEVICES_CAP 50
 #define DETECTION_WINDOW 300
 #define IDLE_TIMEOUT 30000
 #define MAX_TIMESTAMPS 20
 
-// Runtime device limits (set dynamically at boot based on free heap)
-int maxDevices = MIN_DEVICES;
-int maxWifiDevices = MIN_WIFI_DEVICES;
+int maxDevices = MAX_DEVICES_CAP;
+int maxWifiDevices = MAX_WIFI_DEVICES_CAP;
 bool hasPsram = false;
 
 #define BLUE_GREY 0x5D9B
@@ -43,11 +40,13 @@ bool hasPsram = false;
 #define MIN_RSSI_RANGE 12
 #define RSSI_FLOOR -80
 
-#define ESTIMATED_APP_RESERVE_KB 40
-
 const int MEMORY_CRITICAL = 50;
 const int MEMORY_WARNING = 80;
 const int MEMORY_GOOD = 150;
+
+// Rough linear estimate, not based on real current draw — matches the
+// ~4-6h continuous dual-band scanning range documented in the README.
+#define TYPICAL_BATTERY_LIFE_HOURS 5.0f
 
 unsigned long lastBtnAPress = 0;
 unsigned long lastBtnBPress = 0;
@@ -56,11 +55,15 @@ const unsigned long DEBOUNCE_DELAY = 200;
 bool inMenu = false;
 int menuIndex = 0;
 int menuBaseY = 0;
+#define MENU_OPTION_COUNT 6
 
 bool highBrightness = true;
 bool currentlyBright = true;
 bool paused = false;
-bool filterByName = false;
+enum FilterMode { FILTER_ALL, FILTER_NAMED, FILTER_ALERTS };
+FilterMode filterMode = FILTER_ALL;
+bool discreetAlerts = false;
+bool alertSoundEnabled = true;
 bool screenDimmed = false;
 unsigned long lastButtonPressTime = 0;
 unsigned long lastActivityTime = 0;
@@ -74,6 +77,20 @@ unsigned long lastMenuRender = 0;
 bool alertActive = false;
 unsigned long alertStartTime = 0;
 const unsigned long ALERT_DURATION = 5000;
+
+// Alert handoff from scanTask (Core 0) to loop() (Core 1).
+// All M5.Display / M5.update() calls must happen on Core 1 only — scanTask
+// never touches display or button hardware directly, it just deposits data here.
+struct PendingAlertInfo {
+  bool isSpecial;
+  char name[21];
+  char mac[18];
+  float score;
+  uint8_t trackerType;
+};
+PendingAlertInfo pendingAlertInfo;
+volatile bool alertPending = false;
+volatile bool showingAlert = false;
 
 struct WiFiDeviceInfo {
   char ssid[33];
@@ -119,10 +136,35 @@ const char* trackerTypeName(uint8_t type) {
   }
 }
 
+void formatDuration(unsigned long seconds, char *out, size_t outSize) {
+  if (seconds < 60) {
+    snprintf(out, outSize, "<1m");
+  } else if (seconds < 3600) {
+    snprintf(out, outSize, "%lum", seconds / 60);
+  } else {
+    snprintf(out, outSize, "%luh%02lum", seconds / 3600, (seconds % 3600) / 60);
+  }
+}
+
 // IGNORE LIST: Add MAC prefixes of YOUR devices here to ignore them
 // Example: const char *allowlistMacs[] = {"AA:BB:CC", "DD:EE:FF", "11:22:33"};
 // Leave as {""} to track all devices
 const char *allowlistMacs[] = {""};
+
+// Runtime allowlist — devices added in the field (hold Button A on the
+// paused findings list) rather than compiled in. Exact full-MAC match, not
+// an OUI prefix like allowlistMacs[] above: a quick in-field action should
+// suppress the one device you're looking at, not silently widen to every
+// device from that manufacturer. Persisted to /allowlist.txt.
+#define MAX_RUNTIME_ALLOWLIST 20
+char runtimeAllowlist[MAX_RUNTIME_ALLOWLIST][18];
+int runtimeAllowlistCount = 0;
+
+// Topmost device on the currently-rendered paused BLE list, cached by
+// displayTrackedDevices() so handleBtnA()'s hold-to-allowlist gesture acts on
+// exactly what the user is looking at.
+char topVisibleAddress[18] = "";
+bool topVisibleValid = false;
 
 struct TimeWindow {
   unsigned long start;
@@ -163,7 +205,6 @@ NimBLEScan *pBLEScan;
 int scrollIndex = 0;
 
 // Known device ring buffer — compact storage for stable-RSSI devices
-#define MIN_KNOWN 40
 #define MAX_KNOWN_CAP 80
 #define KNOWN_PROMOTE_COUNT 8
 #define KNOWN_RSSI_DRIFT 20
@@ -178,7 +219,7 @@ struct KnownDevice {
 
 KnownDevice *knownDevices = NULL;
 int knownDeviceCount = 0;
-int maxKnownDevices = MIN_KNOWN;
+int maxKnownDevices = MAX_KNOWN_CAP;
 
 SemaphoreHandle_t deviceMutex = NULL;
 TaskHandle_t scanTaskHandle = NULL;
@@ -202,6 +243,11 @@ bool isAllowlistedMac(const char *address) {
   for (size_t i = 0; i < sizeof(allowlistMacs) / sizeof(allowlistMacs[0]); i++) {
     if (strlen(allowlistMacs[i]) > 0 &&
         strncmp(address, allowlistMacs[i], strlen(allowlistMacs[i])) == 0) {
+      return true;
+    }
+  }
+  for (int i = 0; i < runtimeAllowlistCount; i++) {
+    if (strcmp(address, runtimeAllowlist[i]) == 0) {
       return true;
     }
   }
@@ -694,9 +740,25 @@ void alertUser(bool isSpecial, const char *name, const char *mac,
 
   screenOn = true;
   lastActivityTime = millis();
-  M5.Display.setBrightness(204);
+  // Loud mode always jumps to max brightness to grab attention. Discreet mode
+  // respects whatever brightness the user already chose — the point is to
+  // not draw attention, so don't force the screen bright either.
+  M5.Display.setBrightness(discreetAlerts ? (highBrightness ? 204 : 77) : 204);
 
-  if (isSpecial) {
+  if (alertSoundEnabled) {
+    M5.Speaker.tone(1800, 120);
+    delay(160);
+    M5.Speaker.tone(1800, 120);
+    delay(160);
+  }
+
+  if (discreetAlerts) {
+    // Quiet variant: no strobe, just a black screen with a thin colored
+    // border — enough to notice without drawing attention to the device.
+    M5.Display.fillScreen(BLACK);
+    M5.Display.drawRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, isSpecial ? ORANGE : RED);
+    M5.Display.drawRect(1, 1, SCREEN_WIDTH - 2, SCREEN_HEIGHT - 2, isSpecial ? ORANGE : RED);
+  } else if (isSpecial) {
     for (int i = 0; i < 5; i++) {
       M5.Display.fillScreen(RED);
       delay(200);
@@ -708,9 +770,9 @@ void alertUser(bool isSpecial, const char *name, const char *mac,
   }
 
   M5.Display.setCursor(0, 10);
-  M5.Display.setTextColor(WHITE);
+  M5.Display.setTextColor(discreetAlerts ? (isSpecial ? ORANGE : RED) : WHITE);
   M5.Display.setTextSize(2);
-  M5.Display.print("Tracker Detected!");
+  M5.Display.print(discreetAlerts ? "Tracker Alert" : "Tracker Detected!");
   M5.Display.setTextSize(1);
 
   M5.Display.setCursor(0, 40);
@@ -808,7 +870,7 @@ void displayStartupMessage() {
 
   M5.Display.setTextColor(DARKGREY);
   M5.Display.setCursor(85, 72);
-  M5.Display.print("v1.2.1");
+  M5.Display.print("v2.2.0");
 
   M5.Display.drawFastHLine(0, 85, SCREEN_WIDTH, MAGENTA);
 
@@ -946,7 +1008,7 @@ uint32_t getDisplayStateHash() {
   hash = hash * 31 + scrollIndex;
   hash = hash * 31 + (scanningWiFi ? 1 : 0);
   hash = hash * 31 + (paused ? 1 : 0);
-  hash = hash * 31 + (filterByName ? 1 : 0);
+  hash = hash * 31 + (uint32_t)filterMode;
 
   if (scanningWiFi) {
     for (int i = 0; i < wifiDeviceIndex; i++) {
@@ -1016,6 +1078,10 @@ void displayTrackedDevices() {
   int totalItems = 0;
 
   if (scanningWiFi) {
+    // Allowlisting only applies to BLE devices — never act on a stale BLE
+    // address while a WiFi list is on screen.
+    topVisibleValid = false;
+
     totalItems = wifiDeviceIndex;
     for (int i = scrollIndex; i < wifiDeviceIndex && displayed < maxDisplay;
          i++, displayed++) {
@@ -1080,7 +1146,8 @@ void displayTrackedDevices() {
     int sortedIndices[MAX_DEVICES_CAP];
 
     for (int i = 0; i < deviceIndex; i++) {
-      if (filterByName && strlen(trackedDevices[i].name) == 0) continue;
+      if (filterMode == FILTER_NAMED && strlen(trackedDevices[i].name) == 0) continue;
+      if (filterMode == FILTER_ALERTS && !trackedDevices[i].detected) continue;
       sortedIndices[filteredCount++] = i;
     }
 
@@ -1108,6 +1175,14 @@ void displayTrackedDevices() {
     }
 
     totalItems = filteredCount;
+
+    if (filteredCount > 0 && scrollIndex < filteredCount) {
+      strncpy(topVisibleAddress, trackedDevices[sortedIndices[scrollIndex]].address, 17);
+      topVisibleAddress[17] = '\0';
+      topVisibleValid = true;
+    } else {
+      topVisibleValid = false;
+    }
 
     for (int idx = scrollIndex; idx < filteredCount && displayed < maxDisplay;
          idx++, displayed++) {
@@ -1171,6 +1246,14 @@ void displayTrackedDevices() {
         M5.Display.print("!");
         M5.Display.setTextColor(YELLOW);
         M5.Display.print(trackedDevices[i].persistenceScore, 2);
+        char durStr[10];
+        unsigned long nowSec = now / 1000;
+        unsigned long elapsed = (nowSec >= trackedDevices[i].firstSeen)
+                                     ? (nowSec - trackedDevices[i].firstSeen) : 0;
+        formatDuration(elapsed, durStr, sizeof(durStr));
+        M5.Display.setTextColor(WHITE);
+        M5.Display.print(" ");
+        M5.Display.print(durStr);
       } else {
         M5.Display.setTextColor(WHITE);
         M5.Display.print(trackedDevices[i].totalCount);
@@ -1247,23 +1330,30 @@ void displayMenuScreen() {
   int batPercent = (int)((batVoltage - 3.0f) / 1.2f * 100.0f);
   if (batPercent > 100) batPercent = 100;
   if (batPercent < 0) batPercent = 0;
+  float estHoursRemaining = (batPercent / 100.0f) * TYPICAL_BATTERY_LIFE_HOURS;
   M5.Display.print("Bat:");
   M5.Display.print(batPercent);
-  M5.Display.print("% Bright:");
+  M5.Display.print("% (~");
+  if (estHoursRemaining >= 1.0f) {
+    M5.Display.print(estHoursRemaining, 1);
+    M5.Display.print("h)");
+  } else {
+    M5.Display.print((int)(estHoursRemaining * 60));
+    M5.Display.print("m)");
+  }
+  M5.Display.print(" Br:");
   M5.Display.print(highBrightness ? "Hi" : "Lo");
   y += 12;
 
+  // Compact: Timeout/RAM/Tracked share one line so 6 menu rows still fit
+  // this screen's 135px height.
   M5.Display.setCursor(2, y);
-  M5.Display.print("Timeout:");
+  M5.Display.print("T:");
   M5.Display.print(screenTimeoutMs / 1000);
-  M5.Display.print("s Tracked:");
-  M5.Display.print(deviceIndex);
-  y += 12;
-
-  M5.Display.setCursor(2, y);
-  M5.Display.print("RAM:");
+  M5.Display.print("s RAM:");
   M5.Display.print(ESP.getFreeHeap() / 1024);
-  M5.Display.print("KB");
+  M5.Display.print("K Trk:");
+  M5.Display.print(deviceIndex);
   y += 16;
 
   M5.Display.drawLine(0, y, SCREEN_WIDTH, y, DARKGREY);
@@ -1279,6 +1369,14 @@ void displayMenuScreen() {
 
   M5.Display.setCursor(10, y);
   M5.Display.print("Set Screen Timeout");
+  y += 11;
+
+  M5.Display.setCursor(10, y);
+  M5.Display.print("Alert Mode");
+  y += 11;
+
+  M5.Display.setCursor(10, y);
+  M5.Display.print("Export Incident");
   y += 11;
 
   M5.Display.setCursor(10, y);
@@ -1298,7 +1396,7 @@ void displayMenuScreen() {
 }
 
 void highlightMenuOption(int index) {
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < MENU_OPTION_COUNT; i++) {
     M5.Display.setCursor(2, menuBaseY + (i * 11));
     M5.Display.setTextColor(BLACK);
     M5.Display.print(">");
@@ -1307,68 +1405,6 @@ void highlightMenuOption(int index) {
   M5.Display.setCursor(2, menuBaseY + (index * 11));
   M5.Display.setTextColor(YELLOW);
   M5.Display.print(">");
-}
-
-void setScreenTimeout() {
-  int timeoutOptions[] = {10000, 15000, 30000, 60000, 120000, 300000};
-  int optionCount = 6;
-  int selected = 0;
-  
-  for (int i = 0; i < optionCount; i++) {
-    if (timeoutOptions[i] == screenTimeoutMs) {
-      selected = i;
-      break;
-    }
-  }
-
-  bool settingTimeout = true;
-  unsigned long lastRender = 0;
-  
-  while (settingTimeout) {
-    unsigned long now = millis();
-    if (now - lastRender >= 200) {
-      lastRender = now;
-      
-      M5.Display.fillScreen(BLACK);
-      M5.Display.setTextSize(1);
-      M5.Display.setTextColor(GREEN);
-      M5.Display.setCursor(10, 10);
-      M5.Display.print("Screen Timeout");
-      
-      M5.Display.drawLine(0, 20, SCREEN_WIDTH, 20, DARKGREY);
-
-      int y = 30;
-      for (int i = 0; i < optionCount; i++) {
-        if (i == selected) {
-          M5.Display.setTextColor(YELLOW);
-          M5.Display.setCursor(5, y);
-          M5.Display.print(">");
-        } else {
-          M5.Display.setTextColor(WHITE);
-          M5.Display.setCursor(10, y);
-        }
-        M5.Display.print(timeoutOptions[i] / 1000);
-        M5.Display.print("s");
-        y += 12;
-      }
-
-      M5.Display.setTextColor(CYAN);
-      M5.Display.setCursor(10, 110);
-      M5.Display.print("A:Up B:Select");
-    }
-
-    M5.update();
-    if (M5.BtnA.wasPressed()) {
-      selected = (selected - 1 + optionCount) % optionCount;
-      delay(200);
-    }
-    if (M5.BtnB.wasPressed()) {
-      screenTimeoutMs = timeoutOptions[selected];
-      settingTimeout = false;
-      delay(200);
-    }
-    vTaskDelay(10 / portTICK_PERIOD_MS);
-  }
 }
 
 void saveUserPreferences() {
@@ -1381,6 +1417,10 @@ void saveUserPreferences() {
   file.println(highBrightness ? "1" : "0");
   file.print("timeout=");
   file.println(screenTimeoutMs);
+  file.print("discreet=");
+  file.println(discreetAlerts ? "1" : "0");
+  file.print("sound=");
+  file.println(alertSoundEnabled ? "1" : "0");
 
   file.close();
 }
@@ -1399,10 +1439,77 @@ void loadUserPreferences() {
       highBrightness = line.substring(11).toInt() == 1;
     } else if (line.startsWith("timeout=")) {
       screenTimeoutMs = line.substring(8).toInt();
+    } else if (line.startsWith("discreet=")) {
+      discreetAlerts = line.substring(9).toInt() == 1;
+    } else if (line.startsWith("sound=")) {
+      alertSoundEnabled = line.substring(6).toInt() == 1;
     }
   }
 
   file.close();
+}
+
+void saveRuntimeAllowlist() {
+  File file = SPIFFS.open("/allowlist.txt", FILE_WRITE);
+  if (!file) {
+    return;
+  }
+  for (int i = 0; i < runtimeAllowlistCount; i++) {
+    file.println(runtimeAllowlist[i]);
+  }
+  file.close();
+}
+
+void loadRuntimeAllowlist() {
+  File file = SPIFFS.open("/allowlist.txt", FILE_READ);
+  if (!file) {
+    return; // File doesn't exist, nothing allowlisted yet
+  }
+
+  while (file.available() && runtimeAllowlistCount < MAX_RUNTIME_ALLOWLIST) {
+    String line = file.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0) {
+      strncpy(runtimeAllowlist[runtimeAllowlistCount], line.c_str(), 17);
+      runtimeAllowlist[runtimeAllowlistCount][17] = '\0';
+      runtimeAllowlistCount++;
+    }
+  }
+
+  file.close();
+}
+
+// Allowlists a device in the field and makes it disappear from the tracked
+// list immediately — not just "won't alert again", but gone from view now,
+// same as if it had never been seen. isAllowlistedMac() then keeps it out
+// going forward.
+bool allowlistDevice(const char *address) {
+  if (runtimeAllowlistCount >= MAX_RUNTIME_ALLOWLIST) {
+    return false;
+  }
+
+  if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+    return false;
+  }
+
+  strncpy(runtimeAllowlist[runtimeAllowlistCount], address, 17);
+  runtimeAllowlist[runtimeAllowlistCount][17] = '\0';
+  runtimeAllowlistCount++;
+
+  for (int i = 0; i < deviceIndex; i++) {
+    if (strcmp(trackedDevices[i].address, address) == 0) {
+      for (int j = i; j < deviceIndex - 1; j++) {
+        trackedDevices[j] = trackedDevices[j + 1];
+      }
+      deviceIndex--;
+      break;
+    }
+  }
+  scrollIndex = 0;
+
+  xSemaphoreGive(deviceMutex);
+  saveRuntimeAllowlist();
+  return true;
 }
 
 void toggleBrightness() {
@@ -1412,29 +1519,50 @@ void toggleBrightness() {
   saveUserPreferences();
 }
 
-void saveDeviceData() {
+// Deliberate, user-triggered snapshot of currently-alerting devices — distinct
+// from the passive per-scan logging removed earlier. Appends so multiple
+// incidents across a session (or across power cycles) build a record.
+// No RTC/NTP on this device, so timestamps are uptime-relative, not wall-clock.
+int exportIncident() {
   if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(500)) != pdTRUE) {
-    return;
+    return 0;
   }
 
-  File file = SPIFFS.open("/devices.txt", FILE_WRITE);
+  File file = SPIFFS.open("/incidents.txt", FILE_APPEND);
   if (!file) {
     xSemaphoreGive(deviceMutex);
-    return;
+    return 0;
   }
 
+  file.print("=== Incident export at uptime ");
+  file.print(millis() / 1000);
+  file.println("s ===");
+
+  int count = 0;
   for (int i = 0; i < deviceIndex; i++) {
+    if (!trackedDevices[i].detected) continue;
     file.print(trackedDevices[i].address);
     file.print(",");
-    file.print(trackedDevices[i].lastSeen);
+    file.print(strlen(trackedDevices[i].name) > 0 ? trackedDevices[i].name : "Unknown");
     file.print(",");
-    file.print(trackedDevices[i].totalCount);
+    file.print(trackedDevices[i].manufacturer);
     file.print(",");
-    file.println(trackedDevices[i].persistenceScore);
+    file.print(trackerTypeName(trackedDevices[i].trackerType));
+    file.print(",score=");
+    file.print(trackedDevices[i].persistenceScore, 2);
+    file.print(",firstSeenUptime=");
+    file.print(trackedDevices[i].firstSeen);
+    file.print(",totalCount=");
+    file.println(trackedDevices[i].totalCount);
+    count++;
+  }
+  if (count == 0) {
+    file.println("(no currently-alerting devices)");
   }
 
   file.close();
   xSemaphoreGive(deviceMutex);
+  return count;
 }
 
 void clearDevices() {
@@ -1444,13 +1572,29 @@ void clearDevices() {
 
   deviceIndex = 0;
   scrollIndex = 0;
-  SPIFFS.remove("/devices.txt");
 
   xSemaphoreGive(deviceMutex);
 }
 
+// Serial retrieval for exported incidents — send 'd' over Serial Monitor
+// (115200 baud) to dump /incidents.txt. No WiFi/USB-storage export path
+// exists yet (that's Phase 3 territory), so this is the only way to get
+// exported incidents off the device today.
+void dumpIncidentsToSerial() {
+  File file = SPIFFS.open("/incidents.txt", FILE_READ);
+  if (!file) {
+    Serial.println("No incidents exported yet.");
+    return;
+  }
+  Serial.println("--- BEGIN /incidents.txt ---");
+  while (file.available()) {
+    Serial.write(file.read());
+  }
+  Serial.println("--- END /incidents.txt ---");
+  file.close();
+}
+
 void shutdownDevice() {
-  saveDeviceData();
   M5.Display.fillScreen(RED);
   M5.Display.setTextSize(2);
   M5.Display.setTextColor(WHITE);
@@ -1474,11 +1618,22 @@ void executeMenuOption(int index) {
       cycleScreenTimeout();
       break;
     case 2:
+      cycleAlertMode();
+      break;
+    case 3: {
+      int exported = exportIncident();
+      char msg[16];
+      snprintf(msg, sizeof(msg), "%d EXPORTED", exported);
+      showFeedback(msg, exported > 0 ? GREEN : DARKGREY);
+      delay(1000);
+      break;
+    }
+    case 4:
       clearDevices();
       showFeedback("CLEARED", GREEN);
       delay(1000);
       break;
-    case 3:
+    case 5:
       shutdownDevice();
       return;
   }
@@ -1510,6 +1665,30 @@ void cycleScreenTimeout() {
   delay(1000);
 }
 
+// 4-state cycle: Loud+Sound -> Loud+Mute -> Quiet+Sound -> Quiet+Mute -> repeat.
+// Combined into one setting (rather than two independent toggles) to save a
+// menu row on a screen that's already tight on vertical space.
+void cycleAlertMode() {
+  if (!discreetAlerts && alertSoundEnabled) {
+    alertSoundEnabled = false;
+  } else if (!discreetAlerts && !alertSoundEnabled) {
+    discreetAlerts = true;
+    alertSoundEnabled = true;
+  } else if (discreetAlerts && alertSoundEnabled) {
+    alertSoundEnabled = false;
+  } else {
+    discreetAlerts = false;
+    alertSoundEnabled = true;
+  }
+  saveUserPreferences();
+
+  const char *label = discreetAlerts
+                           ? (alertSoundEnabled ? "QUIET+SOUND" : "QUIET+MUTE")
+                           : (alertSoundEnabled ? "LOUD+SOUND" : "LOUD+MUTE");
+  showFeedback(label, discreetAlerts ? CYAN : ORANGE);
+  delay(1000);
+}
+
 bool checkButtonCombo() {
   unsigned long currentMillis = millis();
 
@@ -1527,9 +1706,35 @@ void handleBtnA() {
   lastActivityTime = millis();
 
   if (paused) {
-    if (scrollIndex > 0) {
+    unsigned long pressStart = millis();
+
+    while (M5.BtnA.isPressed() && (millis() - pressStart < 1000)) {
+      M5.update();
+      delay(10);
+    }
+
+    if (millis() - pressStart >= 1000) {
+      // Long-press: allowlist the topmost visible device — kills a false
+      // positive on the spot, no reflash needed. BLE-only (see topVisibleValid).
+      if (topVisibleValid) {
+        char allowedAddr[18];
+        strncpy(allowedAddr, topVisibleAddress, 17);
+        allowedAddr[17] = '\0';
+        if (allowlistDevice(allowedAddr)) {
+          showFeedback("ALLOWLISTED", GREEN, allowedAddr);
+        } else {
+          showFeedback("ALLOW FULL", RED);
+        }
+      } else {
+        showFeedback("NOTHING", DARKGREY);
+      }
+      delay(1200);
+      lastStateHash = 0;
+      lastDisplayRender = 0;
+      displayTrackedDevices();
+    } else if (scrollIndex > 0) {
       scrollIndex--;
-      lastStateHash = 0; 
+      lastStateHash = 0;
       lastDisplayRender = 0;
       displayTrackedDevices();
     }
@@ -1575,9 +1780,14 @@ void handleBtnB() {
       }
     }
   } else {
-    filterByName = !filterByName;
-    showFeedback(filterByName ? "NAMED ONLY" : "SHOW ALL",
-                 filterByName ? CYAN : ORANGE);
+    filterMode = (FilterMode)((filterMode + 1) % 3);
+    const char *label = filterMode == FILTER_NAMED ? "NAMED ONLY"
+                       : filterMode == FILTER_ALERTS ? "ALERTS ONLY"
+                       : "SHOW ALL";
+    uint16_t color = filterMode == FILTER_NAMED ? CYAN
+                    : filterMode == FILTER_ALERTS ? RED
+                    : ORANGE;
+    showFeedback(label, color);
     delay(800);
     lastStateHash = 0;
     lastDisplayRender = 0;
@@ -1608,7 +1818,8 @@ void scanTask(void *parameter) {
   bool localScanningWiFi = true;
 
   while (scanTaskRunning) {
-    if (paused) {
+    if (paused || showingAlert) {
+      esp_task_wdt_reset();
       vTaskDelay(100 / portTICK_PERIOD_MS);
       continue;
     }
@@ -1648,8 +1859,14 @@ void scanTask(void *parameter) {
       NimBLEScanResults foundDevices = pBLEScan->getResults(2000, false);
 
       {
-        bool newTrackerFound = false;
-        int alertDeviceIdx = -1;
+        // A single scan batch can surface several distinct new trackers at
+        // once (e.g. walking past a shelf of AirTags). Queue every one of
+        // them here instead of only ever showing the last — trackedDevices[0]
+        // is only *this* device right when trackDevice() returns true for it
+        // (it just moved itself there), so snapshot immediately or a later
+        // device in the same batch overwrites it and the alert is lost.
+        PendingAlertInfo alertQueue[8];
+        int queuedAlerts = 0;
 
         if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
           int count = foundDevices.getCount();
@@ -1665,20 +1882,27 @@ void scanTask(void *parameter) {
 
             if (!isAllowlistedMac(macAddr)) {
               uint8_t tType = detectTrackerType(*device);
+              bool isNewTracker = false;
 
               // Known trackers bypass the known-device buffer entirely
               if (tType != TRACKER_NONE) {
-                if (trackDevice(macAddr, device->getRSSI(), currentTime,
-                                device->getName().c_str(), tType)) {
-                  newTrackerFound = true;
-                  alertDeviceIdx = 0;
-                }
+                isNewTracker = trackDevice(macAddr, device->getRSSI(), currentTime,
+                                           device->getName().c_str(), tType);
               } else if (!handleKnownDevice(macAddr, device->getRSSI(), currentTime)) {
-                if (trackDevice(macAddr, device->getRSSI(), currentTime,
-                                device->getName().c_str())) {
-                  newTrackerFound = true;
-                  alertDeviceIdx = 0;
-                }
+                isNewTracker = trackDevice(macAddr, device->getRSSI(), currentTime,
+                                           device->getName().c_str());
+              }
+
+              if (isNewTracker && deviceIndex > 0 && queuedAlerts < 8) {
+                DeviceInfo &d = trackedDevices[0];
+                alertQueue[queuedAlerts].isSpecial = d.isSpecial;
+                strncpy(alertQueue[queuedAlerts].name, d.name, 20);
+                alertQueue[queuedAlerts].name[20] = '\0';
+                strncpy(alertQueue[queuedAlerts].mac, d.address, 17);
+                alertQueue[queuedAlerts].mac[17] = '\0';
+                alertQueue[queuedAlerts].score = d.persistenceScore;
+                alertQueue[queuedAlerts].trackerType = d.trackerType;
+                queuedAlerts++;
               }
             }
             vTaskDelay(1 / portTICK_PERIOD_MS);
@@ -1686,28 +1910,18 @@ void scanTask(void *parameter) {
           xSemaphoreGive(deviceMutex);
         }
 
-        if (newTrackerFound && alertDeviceIdx >= 0) {
-          bool isSpecial = false;
-          char alertName[21];
-          char alertAddr[18];
-          float alertScore = 0.0f;
-          uint8_t alertTrackerType = TRACKER_NONE;
+        // Show every queued alert in turn, outside the mutex.
+        for (int q = 0; q < queuedAlerts; q++) {
+          pendingAlertInfo = alertQueue[q];
+          showingAlert = true;
+          alertPending = true;
 
-          if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-            if (deviceIndex > 0) {
-              isSpecial = trackedDevices[0].isSpecial;
-              strncpy(alertName, trackedDevices[0].name, 20);
-              alertName[20] = '\0';
-              strncpy(alertAddr, trackedDevices[0].address, 17);
-              alertAddr[17] = '\0';
-              alertScore = trackedDevices[0].persistenceScore;
-              alertTrackerType = trackedDevices[0].trackerType;
-            }
-            xSemaphoreGive(deviceMutex);
-          }
-
-          if (deviceIndex > 0) {
-            alertUser(isSpecial, alertName, alertAddr, alertScore, alertTrackerType);
+          // Hold here until loop() (Core 1) has shown the alert and the user
+          // dismissed it. Keep feeding the watchdog — this wait is expected
+          // to last as long as the user takes to notice the alert.
+          while (showingAlert && scanTaskRunning) {
+            esp_task_wdt_reset();
+            vTaskDelay(50 / portTICK_PERIOD_MS);
           }
         }
 
@@ -1723,6 +1937,7 @@ void scanTask(void *parameter) {
       xSemaphoreGive(deviceMutex);
     }
 
+    esp_task_wdt_reset();
     vTaskDelay(50 / portTICK_PERIOD_MS);
   }
 
@@ -1731,8 +1946,6 @@ void scanTask(void *parameter) {
 }
 
 void setup() {
-  esp_task_wdt_deinit();
-
   Serial.begin(115200);
   delay(1000);
   Serial.println("Starting setup...");
@@ -1774,39 +1987,34 @@ void setup() {
   WiFi.disconnect();
   Serial.printf("Heap after WiFi init: %dKB\n", ESP.getFreeHeap() / 1024);
 
-  // Detect PSRAM (CPlus2 has 2MB, CPlus1.1 has none)
+  // M5StickS3 always ships with 8MB OPI PSRAM. If it's missing, the board's
+  // PSRAM setting wasn't enabled correctly at build time — fail loudly
+  // instead of silently degrading to a reduced-capacity heap-only mode.
   hasPsram = psramFound();
-
-  // Dynamic sizing: PSRAM boards get full caps, heap-only boards scale to fit
-  if (hasPsram) {
-    maxDevices = MAX_DEVICES_CAP;
-    maxWifiDevices = MAX_WIFI_DEVICES_CAP;
-    maxKnownDevices = MAX_KNOWN_CAP;
-    Serial.printf("PSRAM detected: %dKB — device limits: %d BLE, %d WiFi, %d Known\n",
-                  ESP.getPsramSize() / 1024, maxDevices, maxWifiDevices, maxKnownDevices);
-  } else {
-    size_t freeHeap = ESP.getFreeHeap();
-    size_t reserveBytes = ESTIMATED_APP_RESERVE_KB * 1024;
-    size_t availableBytes = (freeHeap > reserveBytes) ? freeHeap - reserveBytes : 0;
-    size_t perSlot = sizeof(DeviceInfo) + sizeof(WiFiDeviceInfo) + sizeof(KnownDevice) * 2;
-    int slots = availableBytes / perSlot;
-    maxDevices = constrain(slots, MIN_DEVICES, MAX_DEVICES_CAP);
-    maxWifiDevices = constrain(slots, MIN_WIFI_DEVICES, MAX_WIFI_DEVICES_CAP);
-    maxKnownDevices = constrain(slots * 2, MIN_KNOWN, MAX_KNOWN_CAP);
-    Serial.printf("No PSRAM — heap: %dKB — device limits: %d BLE, %d WiFi, %d Known\n",
-                  freeHeap / 1024, maxDevices, maxWifiDevices, maxKnownDevices);
+  if (!hasPsram) {
+    Serial.println("FATAL: No PSRAM detected. Enable 'OPI PSRAM' in board settings and reflash.");
+    M5.Display.fillScreen(RED);
+    M5.Display.setTextSize(2);
+    M5.Display.setTextColor(WHITE);
+    M5.Display.setCursor(10, 40);
+    M5.Display.print("NO PSRAM");
+    M5.Display.setTextSize(1);
+    M5.Display.setCursor(10, 70);
+    M5.Display.print("Enable OPI PSRAM in board");
+    M5.Display.setCursor(10, 82);
+    M5.Display.print("settings, then reflash");
+    while (1) delay(1000);
   }
 
-  // Allocate device arrays (PSRAM if available, else internal heap)
-  if (hasPsram) {
-    trackedDevices = (DeviceInfo *)ps_malloc(maxDevices * sizeof(DeviceInfo));
-    wifiDevices = (WiFiDeviceInfo *)ps_malloc(maxWifiDevices * sizeof(WiFiDeviceInfo));
-    knownDevices = (KnownDevice *)ps_malloc(maxKnownDevices * sizeof(KnownDevice));
-  } else {
-    trackedDevices = (DeviceInfo *)malloc(maxDevices * sizeof(DeviceInfo));
-    wifiDevices = (WiFiDeviceInfo *)malloc(maxWifiDevices * sizeof(WiFiDeviceInfo));
-    knownDevices = (KnownDevice *)malloc(maxKnownDevices * sizeof(KnownDevice));
-  }
+  maxDevices = MAX_DEVICES_CAP;
+  maxWifiDevices = MAX_WIFI_DEVICES_CAP;
+  maxKnownDevices = MAX_KNOWN_CAP;
+  Serial.printf("PSRAM detected: %dKB — device limits: %d BLE, %d WiFi, %d Known\n",
+                ESP.getPsramSize() / 1024, maxDevices, maxWifiDevices, maxKnownDevices);
+
+  trackedDevices = (DeviceInfo *)ps_malloc(maxDevices * sizeof(DeviceInfo));
+  wifiDevices = (WiFiDeviceInfo *)ps_malloc(maxWifiDevices * sizeof(WiFiDeviceInfo));
+  knownDevices = (KnownDevice *)ps_malloc(maxKnownDevices * sizeof(KnownDevice));
   memset(trackedDevices, 0, maxDevices * sizeof(DeviceInfo));
   memset(wifiDevices, 0, maxWifiDevices * sizeof(WiFiDeviceInfo));
   memset(knownDevices, 0, maxKnownDevices * sizeof(KnownDevice));
@@ -1905,6 +2113,9 @@ void setup() {
   currentlyBright = highBrightness;
   Serial.print("User preferences loaded - Brightness: ");
   Serial.println(highBrightness ? "High" : "Low");
+
+  loadRuntimeAllowlist();
+  Serial.printf("Runtime allowlist loaded: %d device(s)\n", runtimeAllowlistCount);
   Serial.print("Screen Timeout: ");
   Serial.println(screenTimeoutMs);
 
@@ -1926,16 +2137,46 @@ void setup() {
   M5.Display.print("Starting scans...");
   Serial.println("Initial display ready");
 
-  xTaskCreatePinnedToCore(
+  BaseType_t scanTaskCreated = xTaskCreatePinnedToCore(
     scanTask,
     "ScanTask",
-    hasPsram ? 16384 : 12288,
+    16384,
     NULL,
     1,
     &scanTaskHandle,
     0
   );
+  if (scanTaskCreated != pdPASS || scanTaskHandle == NULL) {
+    // Must halt here rather than continue: esp_task_wdt_add(NULL) below would
+    // otherwise subscribe *this* task (Core 1 loop) to the watchdog, and
+    // since loop() never resets it, that's a guaranteed reboot-loop.
+    Serial.println("ERROR: Failed to create scanTask!");
+    M5.Display.fillScreen(RED);
+    M5.Display.setTextSize(2);
+    M5.Display.setTextColor(WHITE);
+    M5.Display.setCursor(10, 50);
+    M5.Display.print("TASK INIT");
+    M5.Display.setCursor(10, 75);
+    M5.Display.print("FAILED");
+    while (1) { delay(300); }
+  }
   Serial.println("Scanning task started on Core 0");
+
+  // Watchdog covers scanTask only (idle_core_mask=0 — don't watch idle tasks,
+  // that's what made the old default WDT fire spuriously and got it disabled
+  // entirely). A hung BLE/WiFi call now reboots the device instead of
+  // freezing it forever; scanTask feeds it every loop iteration and while
+  // legitimately waiting on `paused` or an on-screen alert.
+  esp_task_wdt_config_t twdtConfig = {
+    .timeout_ms = 20000,
+    .idle_core_mask = 0,
+    .trigger_panic = true
+  };
+  if (esp_task_wdt_init(&twdtConfig) == ESP_ERR_INVALID_STATE) {
+    esp_task_wdt_reconfigure(&twdtConfig);
+  }
+  esp_task_wdt_add(scanTaskHandle);
+  Serial.println("Task watchdog armed on scanTask (20s timeout)");
 
   delay(100);
 
@@ -1954,6 +2195,25 @@ void loop() {
   const unsigned long MEMORY_CHECK_INTERVAL = 5000;
 
   M5.update();
+
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'd' || c == 'D') {
+      dumpIncidentsToSerial();
+    }
+  }
+
+  // Tracker alert deposited by scanTask (Core 0) — render and wait for
+  // dismissal here on Core 1, the only task allowed to touch the display/buttons.
+  if (alertPending) {
+    PendingAlertInfo local = pendingAlertInfo;
+    alertPending = false;
+    alertUser(local.isSpecial, local.name, local.mac, local.score, local.trackerType);
+    showingAlert = false;
+    forceDisplayRefresh();
+    lastDisplayUpdate = currentMillis;
+    return;
+  }
 
   if (currentMillis - lastMemoryCheck > MEMORY_CHECK_INTERVAL) {
     lastMemoryCheck = currentMillis;
@@ -2043,7 +2303,7 @@ void loop() {
       // MENU MODE
       if (btnA && (currentMillis - lastBtnAPress > DEBOUNCE_DELAY)) {
         lastBtnAPress = currentMillis;
-        menuIndex = (menuIndex + 1) % 4;
+        menuIndex = (menuIndex + 1) % MENU_OPTION_COUNT;
         highlightMenuOption(menuIndex);
         return;
       }
@@ -2095,10 +2355,4 @@ void loop() {
   }
 
   vTaskDelay(50 / portTICK_PERIOD_MS);
-
-  static unsigned long lastSaveTime = 0;
-  if (currentMillis - lastSaveTime > 60000) {
-    saveDeviceData();
-    lastSaveTime = currentMillis;
-  }
 }
