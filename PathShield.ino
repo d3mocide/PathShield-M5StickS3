@@ -816,7 +816,7 @@ void displayStartupMessage() {
 
   M5.Display.setTextColor(DARKGREY);
   M5.Display.setCursor(85, 72);
-  M5.Display.print("v1.2.1");
+  M5.Display.print("v2.2.0");
 
   M5.Display.drawFastHLine(0, 85, SCREEN_WIDTH, MAGENTA);
 
@@ -1315,68 +1315,6 @@ void highlightMenuOption(int index) {
   M5.Display.setCursor(2, menuBaseY + (index * 11));
   M5.Display.setTextColor(YELLOW);
   M5.Display.print(">");
-}
-
-void setScreenTimeout() {
-  int timeoutOptions[] = {10000, 15000, 30000, 60000, 120000, 300000};
-  int optionCount = 6;
-  int selected = 0;
-  
-  for (int i = 0; i < optionCount; i++) {
-    if (timeoutOptions[i] == screenTimeoutMs) {
-      selected = i;
-      break;
-    }
-  }
-
-  bool settingTimeout = true;
-  unsigned long lastRender = 0;
-  
-  while (settingTimeout) {
-    unsigned long now = millis();
-    if (now - lastRender >= 200) {
-      lastRender = now;
-      
-      M5.Display.fillScreen(BLACK);
-      M5.Display.setTextSize(1);
-      M5.Display.setTextColor(GREEN);
-      M5.Display.setCursor(10, 10);
-      M5.Display.print("Screen Timeout");
-      
-      M5.Display.drawLine(0, 20, SCREEN_WIDTH, 20, DARKGREY);
-
-      int y = 30;
-      for (int i = 0; i < optionCount; i++) {
-        if (i == selected) {
-          M5.Display.setTextColor(YELLOW);
-          M5.Display.setCursor(5, y);
-          M5.Display.print(">");
-        } else {
-          M5.Display.setTextColor(WHITE);
-          M5.Display.setCursor(10, y);
-        }
-        M5.Display.print(timeoutOptions[i] / 1000);
-        M5.Display.print("s");
-        y += 12;
-      }
-
-      M5.Display.setTextColor(CYAN);
-      M5.Display.setCursor(10, 110);
-      M5.Display.print("A:Up B:Select");
-    }
-
-    M5.update();
-    if (M5.BtnA.wasPressed()) {
-      selected = (selected - 1 + optionCount) % optionCount;
-      delay(200);
-    }
-    if (M5.BtnB.wasPressed()) {
-      screenTimeoutMs = timeoutOptions[selected];
-      settingTimeout = false;
-      delay(200);
-    }
-    vTaskDelay(10 / portTICK_PERIOD_MS);
-  }
 }
 
 void saveUserPreferences() {
@@ -1945,7 +1883,7 @@ void setup() {
   M5.Display.print("Starting scans...");
   Serial.println("Initial display ready");
 
-  xTaskCreatePinnedToCore(
+  BaseType_t scanTaskCreated = xTaskCreatePinnedToCore(
     scanTask,
     "ScanTask",
     16384,
@@ -1954,6 +1892,20 @@ void setup() {
     &scanTaskHandle,
     0
   );
+  if (scanTaskCreated != pdPASS || scanTaskHandle == NULL) {
+    // Must halt here rather than continue: esp_task_wdt_add(NULL) below would
+    // otherwise subscribe *this* task (Core 1 loop) to the watchdog, and
+    // since loop() never resets it, that's a guaranteed reboot-loop.
+    Serial.println("ERROR: Failed to create scanTask!");
+    M5.Display.fillScreen(RED);
+    M5.Display.setTextSize(2);
+    M5.Display.setTextColor(WHITE);
+    M5.Display.setCursor(10, 50);
+    M5.Display.print("TASK INIT");
+    M5.Display.setCursor(10, 75);
+    M5.Display.print("FAILED");
+    while (1) { delay(300); }
+  }
   Serial.println("Scanning task started on Core 0");
 
   // Watchdog covers scanTask only (idle_core_mask=0 — don't watch idle tasks,
