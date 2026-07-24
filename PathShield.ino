@@ -33,12 +33,21 @@ bool hasPsram = false;
 
 #define MIN_DETECTIONS 12
 #define MIN_WINDOWS 3
-#define PERSISTENCE_THRESHOLD 0.75
-#define RSSI_STABILITY_THRESHOLD 10
-#define RSSI_VARIATION_THRESHOLD 15
 #define EPSILON_CONNECTED_GAP 180
 #define MIN_RSSI_RANGE 12
 #define RSSI_FLOOR -80
+
+// The three sensitivity knobs that most directly affect false positive/negative
+// rate. Runtime-configurable via the serial "threshold" command and persisted to
+// /prefs.txt — the rest of the scoring constants above stay compile-time, since
+// they're the algorithm's internal weighting rather than something to safely
+// hand-tune device-side.
+#define DEFAULT_PERSISTENCE_THRESHOLD 0.75f
+#define DEFAULT_RSSI_STABILITY_THRESHOLD 10
+#define DEFAULT_RSSI_VARIATION_THRESHOLD 15
+float persistenceThreshold = DEFAULT_PERSISTENCE_THRESHOLD;
+int rssiStabilityThreshold = DEFAULT_RSSI_STABILITY_THRESHOLD;
+int rssiVariationThreshold = DEFAULT_RSSI_VARIATION_THRESHOLD;
 
 const int MEMORY_CRITICAL = 50;
 const int MEMORY_WARNING = 80;
@@ -108,8 +117,14 @@ bool scanningWiFi = true;
 unsigned long lastScanSwitch = 0;
 const unsigned long SCAN_SWITCH_INTERVAL = 3000;
 
-// Privacy Invader Defaults: Axon cameras, Liteon Technology (Flock), Utility Inc (Flock) OUIs
-const char *specialMacs[] = {"00:25:DF", "14:5A:FC", "00:09:BC"};
+// Privacy Invader Defaults: Axon cameras, Liteon Technology (Flock), Utility Inc (Flock) OUIs.
+// Runtime-configurable via the serial "special" command (see handleSpecialCommand())
+// and persisted to /specialmacs.txt — falls back to these compiled-in defaults
+// whenever that file doesn't exist yet (first boot, or after a "special reset").
+#define MAX_SPECIAL_MACS 20
+const char *defaultSpecialMacs[] = {"00:25:DF", "14:5A:FC", "00:09:BC"};
+char specialMacs[MAX_SPECIAL_MACS][18];
+int specialMacsCount = 0;
 
 // BLE Tracker Type Detection
 enum TrackerType : uint8_t {
@@ -231,7 +246,7 @@ class MyScanCallbacks : public NimBLEScanCallbacks {
 };
 
 bool isSpecialMac(const char *address) {
-  for (size_t i = 0; i < sizeof(specialMacs) / sizeof(specialMacs[0]); i++) {
+  for (int i = 0; i < specialMacsCount; i++) {
     if (strncmp(address, specialMacs[i], strlen(specialMacs[i])) == 0) {
       return true;
     }
@@ -523,12 +538,12 @@ bool trackDevice(const char *address, int rssi, unsigned long currentTime,
         trackedDevices[i].tsCount++;
 
       int rssiDiff = abs(trackedDevices[i].lastRssi - rssi);
-      if (rssiDiff <= RSSI_STABILITY_THRESHOLD) {
+      if (rssiDiff <= rssiStabilityThreshold) {
         trackedDevices[i].stableRssiCount++;
       } else {
         trackedDevices[i].stableRssiCount = 0;
       }
-      if (rssiDiff >= RSSI_VARIATION_THRESHOLD) {
+      if (rssiDiff >= rssiVariationThreshold) {
         trackedDevices[i].variationCount++;
       }
       trackedDevices[i].lastRssi = rssi;
@@ -563,7 +578,7 @@ bool trackDevice(const char *address, int rssi, unsigned long currentTime,
           newTracker = true;
         }
         moveToTop(i);
-      } else if (trackedDevices[i].persistenceScore >= PERSISTENCE_THRESHOLD) {
+      } else if (trackedDevices[i].persistenceScore >= persistenceThreshold) {
         trackedDevices[i].detected = true;
         trackedDevices[i].isSpecial = false;
         trackedDevices[i].trackerType = TRACKER_PERSISTENCE;
@@ -1421,6 +1436,12 @@ void saveUserPreferences() {
   file.println(discreetAlerts ? "1" : "0");
   file.print("sound=");
   file.println(alertSoundEnabled ? "1" : "0");
+  file.print("persistThresh=");
+  file.println(persistenceThreshold, 2);
+  file.print("rssiStable=");
+  file.println(rssiStabilityThreshold);
+  file.print("rssiVariation=");
+  file.println(rssiVariationThreshold);
 
   file.close();
 }
@@ -1443,6 +1464,15 @@ void loadUserPreferences() {
       discreetAlerts = line.substring(9).toInt() == 1;
     } else if (line.startsWith("sound=")) {
       alertSoundEnabled = line.substring(6).toInt() == 1;
+    } else if (line.startsWith("persistThresh=")) {
+      float v = line.substring(14).toFloat();
+      if (v >= 0.0f && v <= 1.0f) persistenceThreshold = v;
+    } else if (line.startsWith("rssiStable=")) {
+      int v = line.substring(11).toInt();
+      if (v >= 1 && v <= 50) rssiStabilityThreshold = v;
+    } else if (line.startsWith("rssiVariation=")) {
+      int v = line.substring(14).toInt();
+      if (v >= 1 && v <= 50) rssiVariationThreshold = v;
     }
   }
 
@@ -1477,6 +1507,111 @@ void loadRuntimeAllowlist() {
   }
 
   file.close();
+}
+
+// Removes a device from the runtime allowlist by exact MAC match — the inverse
+// of allowlistDevice(). No in-field button gesture for this (by the time a
+// device is allowlisted it's no longer on the tracked list to point a
+// long-press at), so it's serial-command only via "allow remove".
+bool removeFromAllowlist(const char *address) {
+  if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+    return false;
+  }
+
+  bool found = false;
+  for (int i = 0; i < runtimeAllowlistCount; i++) {
+    if (strcmp(runtimeAllowlist[i], address) == 0) {
+      for (int j = i; j < runtimeAllowlistCount - 1; j++) {
+        strcpy(runtimeAllowlist[j], runtimeAllowlist[j + 1]);
+      }
+      runtimeAllowlistCount--;
+      found = true;
+      break;
+    }
+  }
+
+  xSemaphoreGive(deviceMutex);
+  if (found) saveRuntimeAllowlist();
+  return found;
+}
+
+void resetSpecialMacsToDefault() {
+  specialMacsCount = 0;
+  for (size_t i = 0; i < sizeof(defaultSpecialMacs) / sizeof(defaultSpecialMacs[0])
+                      && specialMacsCount < MAX_SPECIAL_MACS; i++) {
+    strncpy(specialMacs[specialMacsCount], defaultSpecialMacs[i], 17);
+    specialMacs[specialMacsCount][17] = '\0';
+    specialMacsCount++;
+  }
+}
+
+void saveSpecialMacs() {
+  File file = SPIFFS.open("/specialmacs.txt", FILE_WRITE);
+  if (!file) {
+    return;
+  }
+  for (int i = 0; i < specialMacsCount; i++) {
+    file.println(specialMacs[i]);
+  }
+  file.close();
+}
+
+void loadSpecialMacs() {
+  File file = SPIFFS.open("/specialmacs.txt", FILE_READ);
+  if (!file) {
+    resetSpecialMacsToDefault(); // No saved list yet — use compiled-in defaults
+    return;
+  }
+
+  specialMacsCount = 0;
+  while (file.available() && specialMacsCount < MAX_SPECIAL_MACS) {
+    String line = file.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0) {
+      strncpy(specialMacs[specialMacsCount], line.c_str(), 17);
+      specialMacs[specialMacsCount][17] = '\0';
+      specialMacsCount++;
+    }
+  }
+
+  file.close();
+}
+
+bool addSpecialMac(const char *prefix) {
+  if (specialMacsCount >= MAX_SPECIAL_MACS) {
+    return false;
+  }
+
+  if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+    return false;
+  }
+
+  strncpy(specialMacs[specialMacsCount], prefix, 17);
+  specialMacs[specialMacsCount][17] = '\0';
+  specialMacsCount++;
+
+  xSemaphoreGive(deviceMutex);
+  saveSpecialMacs();
+  return true;
+}
+
+bool removeSpecialMac(int index) {
+  if (index < 0 || index >= specialMacsCount) {
+    return false;
+  }
+
+  if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+    return false;
+  }
+
+  for (int i = index; i < specialMacsCount - 1; i++) {
+    strcpy(specialMacs[i], specialMacs[i + 1]);
+  }
+  specialMacsCount--;
+
+  xSemaphoreGive(deviceMutex);
+  saveSpecialMacs();
+  return true;
 }
 
 // Allowlists a device in the field and makes it disappear from the tracked
@@ -1576,10 +1711,9 @@ void clearDevices() {
   xSemaphoreGive(deviceMutex);
 }
 
-// Serial retrieval for exported incidents — send 'd' over Serial Monitor
-// (115200 baud) to dump /incidents.txt. No WiFi/USB-storage export path
-// exists yet (that's Phase 3 territory), so this is the only way to get
-// exported incidents off the device today.
+// Serial retrieval for exported incidents — send "dump" over Serial Monitor
+// (115200 baud, newline line ending) to print /incidents.txt. No WiFi/USB-storage
+// export path exists (deliberately — see the serial command console below for why).
 void dumpIncidentsToSerial() {
   File file = SPIFFS.open("/incidents.txt", FILE_READ);
   if (!file) {
@@ -1592,6 +1726,218 @@ void dumpIncidentsToSerial() {
   }
   Serial.println("--- END /incidents.txt ---");
   file.close();
+}
+
+// No-reflash configuration console. A line-based command protocol over the
+// same USB-serial connection Serial Monitor already uses for the "dump"
+// command — deliberately not a WiFi-AP config page: this is an anti-stalking
+// device, and Phase 2's "Quiet mode" exists specifically so it doesn't draw
+// attention, so it shouldn't itself broadcast a discoverable SSID. Serial
+// requires physical USB access and stays silent on RF.
+//
+// Requires the Serial Monitor's line ending set to "Newline" (or "Both NL &
+// CR") — commands are dispatched on \n, not per keystroke.
+void printSerialHelp() {
+  Serial.println("--- PathShield serial commands ---");
+  Serial.println("  help                             Show this list");
+  Serial.println("  dump                             Print /incidents.txt");
+  Serial.println("  config                           Show full current configuration");
+  Serial.println("  special list                     List privacy-invader MAC prefixes");
+  Serial.println("  special add <prefix>              e.g. special add 00:25:DF");
+  Serial.println("  special remove <index|prefix>     Remove by index (from 'special list') or exact text");
+  Serial.println("  special reset                     Reset to compiled-in defaults");
+  Serial.println("  allow list                       List runtime allowlist (exact MACs)");
+  Serial.println("  allow add <MAC>                   e.g. allow add AA:BB:CC:DD:EE:FF");
+  Serial.println("  allow remove <MAC>                Remove a MAC from the allowlist");
+  Serial.println("  threshold list                   Show sensitivity thresholds");
+  Serial.println("  threshold set <name> <value>      name: persistence | rssi_stability | rssi_variation");
+  Serial.println("  threshold reset                   Reset thresholds to defaults");
+  Serial.println("All changes are persisted to SPIFFS immediately — no reflash needed.");
+}
+
+void handleSpecialCommand(const char *sub, const char *arg) {
+  if (!sub || strcasecmp(sub, "list") == 0) {
+    Serial.println("--- Special (privacy-invader) MAC prefixes ---");
+    for (int i = 0; i < specialMacsCount; i++) {
+      Serial.printf("  [%d] %s\n", i, specialMacs[i]);
+    }
+    if (specialMacsCount == 0) Serial.println("  (none)");
+  } else if (strcasecmp(sub, "add") == 0) {
+    if (!arg || strlen(arg) < 2) {
+      Serial.println("Usage: special add <MAC-prefix, e.g. 00:25:DF>");
+      return;
+    }
+    if (addSpecialMac(arg)) {
+      Serial.printf("Added special MAC prefix: %s\n", arg);
+    } else {
+      Serial.println("Failed to add (list full or device busy) — try again.");
+    }
+  } else if (strcasecmp(sub, "remove") == 0) {
+    if (!arg) {
+      Serial.println("Usage: special remove <index|prefix>");
+      return;
+    }
+    int idx = -1;
+    bool numeric = true;
+    for (const char *p = arg; *p; p++) {
+      if (*p < '0' || *p > '9') { numeric = false; break; }
+    }
+    if (numeric) {
+      idx = atoi(arg);
+    } else {
+      for (int i = 0; i < specialMacsCount; i++) {
+        if (strcasecmp(specialMacs[i], arg) == 0) { idx = i; break; }
+      }
+    }
+    if (removeSpecialMac(idx)) {
+      Serial.println("Removed.");
+    } else {
+      Serial.println("Not found.");
+    }
+  } else if (strcasecmp(sub, "reset") == 0) {
+    resetSpecialMacsToDefault();
+    saveSpecialMacs();
+    Serial.println("Special MAC list reset to compiled-in defaults.");
+  } else {
+    Serial.println("Usage: special <list|add|remove|reset> [value]");
+  }
+}
+
+void handleAllowCommand(const char *sub, const char *arg) {
+  if (!sub || strcasecmp(sub, "list") == 0) {
+    Serial.println("--- Runtime allowlist (exact MAC) ---");
+    for (int i = 0; i < runtimeAllowlistCount; i++) {
+      Serial.printf("  [%d] %s\n", i, runtimeAllowlist[i]);
+    }
+    if (runtimeAllowlistCount == 0) Serial.println("  (none)");
+  } else if (strcasecmp(sub, "add") == 0) {
+    if (!arg || strlen(arg) != 17) {
+      Serial.println("Usage: allow add <AA:BB:CC:DD:EE:FF> (full MAC, exact match)");
+      return;
+    }
+    if (allowlistDevice(arg)) {
+      Serial.printf("Allowlisted: %s\n", arg);
+    } else {
+      Serial.println("Failed to add (list full or device busy) — try again.");
+    }
+  } else if (strcasecmp(sub, "remove") == 0) {
+    if (!arg) {
+      Serial.println("Usage: allow remove <AA:BB:CC:DD:EE:FF>");
+      return;
+    }
+    if (removeFromAllowlist(arg)) {
+      Serial.println("Removed.");
+    } else {
+      Serial.println("Not found.");
+    }
+  } else {
+    Serial.println("Usage: allow <list|add|remove> [MAC]");
+  }
+}
+
+void handleThresholdCommand(const char *sub, const char *name, const char *value) {
+  if (!sub || strcasecmp(sub, "list") == 0 || strcasecmp(sub, "show") == 0) {
+    Serial.println("--- Sensitivity thresholds ---");
+    Serial.printf("  persistence     = %.2f  (0.0-1.0, alert once persistence score reaches this)\n",
+                  persistenceThreshold);
+    Serial.printf("  rssi_stability  = %d dBm  (delta at/below this counts a reading as 'stable')\n",
+                  rssiStabilityThreshold);
+    Serial.printf("  rssi_variation  = %d dBm  (delta at/above this counts as sketchy variance)\n",
+                  rssiVariationThreshold);
+    return;
+  }
+  if (strcasecmp(sub, "reset") == 0) {
+    if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+      persistenceThreshold = DEFAULT_PERSISTENCE_THRESHOLD;
+      rssiStabilityThreshold = DEFAULT_RSSI_STABILITY_THRESHOLD;
+      rssiVariationThreshold = DEFAULT_RSSI_VARIATION_THRESHOLD;
+      xSemaphoreGive(deviceMutex);
+    }
+    saveUserPreferences();
+    Serial.println("Thresholds reset to defaults.");
+    return;
+  }
+  if (strcasecmp(sub, "set") == 0) {
+    if (!name || !value) {
+      Serial.println("Usage: threshold set <persistence|rssi_stability|rssi_variation> <value>");
+      return;
+    }
+    if (strcasecmp(name, "persistence") == 0) {
+      float v = atof(value);
+      if (v < 0.0f || v > 1.0f) {
+        Serial.println("persistence must be between 0.0 and 1.0");
+        return;
+      }
+      if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        persistenceThreshold = v;
+        xSemaphoreGive(deviceMutex);
+      }
+    } else if (strcasecmp(name, "rssi_stability") == 0) {
+      int v = atoi(value);
+      if (v < 1 || v > 50) {
+        Serial.println("rssi_stability must be between 1 and 50");
+        return;
+      }
+      if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        rssiStabilityThreshold = v;
+        xSemaphoreGive(deviceMutex);
+      }
+    } else if (strcasecmp(name, "rssi_variation") == 0) {
+      int v = atoi(value);
+      if (v < 1 || v > 50) {
+        Serial.println("rssi_variation must be between 1 and 50");
+        return;
+      }
+      if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        rssiVariationThreshold = v;
+        xSemaphoreGive(deviceMutex);
+      }
+    } else {
+      Serial.println("Unknown threshold. Use: persistence, rssi_stability, rssi_variation");
+      return;
+    }
+    saveUserPreferences();
+    Serial.printf("Set %s = %s\n", name, value);
+    return;
+  }
+  Serial.println("Usage: threshold <list|set|reset> ...");
+}
+
+void printSerialConfig() {
+  Serial.println("=== PathShield configuration ===");
+  handleSpecialCommand("list", NULL);
+  handleAllowCommand("list", NULL);
+  handleThresholdCommand("list", NULL, NULL);
+}
+
+// Dispatches one already-trimmed, null-terminated command line. Tokenizes with
+// strtok in place, so `line` must be a writable buffer (not a string literal).
+void handleSerialCommand(char *line) {
+  char *cmd = strtok(line, " ");
+  if (!cmd) return;
+
+  if (strcasecmp(cmd, "help") == 0 || strcmp(cmd, "?") == 0) {
+    printSerialHelp();
+  } else if (strcasecmp(cmd, "dump") == 0 || strcasecmp(cmd, "d") == 0) {
+    dumpIncidentsToSerial();
+  } else if (strcasecmp(cmd, "config") == 0) {
+    printSerialConfig();
+  } else if (strcasecmp(cmd, "special") == 0) {
+    char *sub = strtok(NULL, " ");
+    char *arg = strtok(NULL, " ");
+    handleSpecialCommand(sub, arg);
+  } else if (strcasecmp(cmd, "allow") == 0) {
+    char *sub = strtok(NULL, " ");
+    char *arg = strtok(NULL, " ");
+    handleAllowCommand(sub, arg);
+  } else if (strcasecmp(cmd, "threshold") == 0) {
+    char *sub = strtok(NULL, " ");
+    char *name = strtok(NULL, " ");
+    char *value = strtok(NULL, " ");
+    handleThresholdCommand(sub, name, value);
+  } else {
+    Serial.printf("Unknown command '%s'. Type 'help' for commands.\n", cmd);
+  }
 }
 
 void shutdownDevice() {
@@ -2116,6 +2462,13 @@ void setup() {
 
   loadRuntimeAllowlist();
   Serial.printf("Runtime allowlist loaded: %d device(s)\n", runtimeAllowlistCount);
+
+  loadSpecialMacs();
+  Serial.printf("Special MAC prefixes loaded: %d\n", specialMacsCount);
+  Serial.printf("Thresholds — persistence: %.2f, rssi_stability: %d, rssi_variation: %d\n",
+                persistenceThreshold, rssiStabilityThreshold, rssiVariationThreshold);
+  Serial.println("Type 'help' over serial for the no-reflash config console.");
+
   Serial.print("Screen Timeout: ");
   Serial.println(screenTimeoutMs);
 
@@ -2191,15 +2544,23 @@ void loop() {
   static unsigned long lastDisplayUpdate = 0;
   static bool firstRun = true;
   static unsigned long lastMemoryCheck = 0;
+  static char serialLineBuf[64];
+  static size_t serialLineLen = 0;
   const unsigned long DISPLAY_UPDATE_INTERVAL = 1000;
   const unsigned long MEMORY_CHECK_INTERVAL = 5000;
 
   M5.update();
 
-  if (Serial.available()) {
+  while (Serial.available()) {
     char c = Serial.read();
-    if (c == 'd' || c == 'D') {
-      dumpIncidentsToSerial();
+    if (c == '\n' || c == '\r') {
+      if (serialLineLen > 0) {
+        serialLineBuf[serialLineLen] = '\0';
+        handleSerialCommand(serialLineBuf);
+        serialLineLen = 0;
+      }
+    } else if (serialLineLen < sizeof(serialLineBuf) - 1) {
+      serialLineBuf[serialLineLen++] = c;
     }
   }
 
