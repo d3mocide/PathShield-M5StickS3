@@ -44,6 +44,10 @@ const int MEMORY_CRITICAL = 50;
 const int MEMORY_WARNING = 80;
 const int MEMORY_GOOD = 150;
 
+// Rough linear estimate, not based on real current draw — matches the
+// ~4-6h continuous dual-band scanning range documented in the README.
+#define TYPICAL_BATTERY_LIFE_HOURS 5.0f
+
 unsigned long lastBtnAPress = 0;
 unsigned long lastBtnBPress = 0;
 unsigned long lastComboCheck = 0;
@@ -55,7 +59,8 @@ int menuBaseY = 0;
 bool highBrightness = true;
 bool currentlyBright = true;
 bool paused = false;
-bool filterByName = false;
+enum FilterMode { FILTER_ALL, FILTER_NAMED, FILTER_ALERTS };
+FilterMode filterMode = FILTER_ALL;
 bool screenDimmed = false;
 unsigned long lastButtonPressTime = 0;
 unsigned long lastActivityTime = 0;
@@ -125,6 +130,16 @@ const char* trackerTypeName(uint8_t type) {
     case TRACKER_PRIVACY_INVADER:return "Privacy Inv";
     case TRACKER_PERSISTENCE:    return "Persistence";
     default:                     return "Unknown";
+  }
+}
+
+void formatDuration(unsigned long seconds, char *out, size_t outSize) {
+  if (seconds < 60) {
+    snprintf(out, outSize, "<1m");
+  } else if (seconds < 3600) {
+    snprintf(out, outSize, "%lum", seconds / 60);
+  } else {
+    snprintf(out, outSize, "%luh%02lum", seconds / 3600, (seconds % 3600) / 60);
   }
 }
 
@@ -954,7 +969,7 @@ uint32_t getDisplayStateHash() {
   hash = hash * 31 + scrollIndex;
   hash = hash * 31 + (scanningWiFi ? 1 : 0);
   hash = hash * 31 + (paused ? 1 : 0);
-  hash = hash * 31 + (filterByName ? 1 : 0);
+  hash = hash * 31 + (uint32_t)filterMode;
 
   if (scanningWiFi) {
     for (int i = 0; i < wifiDeviceIndex; i++) {
@@ -1088,7 +1103,8 @@ void displayTrackedDevices() {
     int sortedIndices[MAX_DEVICES_CAP];
 
     for (int i = 0; i < deviceIndex; i++) {
-      if (filterByName && strlen(trackedDevices[i].name) == 0) continue;
+      if (filterMode == FILTER_NAMED && strlen(trackedDevices[i].name) == 0) continue;
+      if (filterMode == FILTER_ALERTS && !trackedDevices[i].detected) continue;
       sortedIndices[filteredCount++] = i;
     }
 
@@ -1179,6 +1195,14 @@ void displayTrackedDevices() {
         M5.Display.print("!");
         M5.Display.setTextColor(YELLOW);
         M5.Display.print(trackedDevices[i].persistenceScore, 2);
+        char durStr[10];
+        unsigned long nowSec = now / 1000;
+        unsigned long elapsed = (nowSec >= trackedDevices[i].firstSeen)
+                                     ? (nowSec - trackedDevices[i].firstSeen) : 0;
+        formatDuration(elapsed, durStr, sizeof(durStr));
+        M5.Display.setTextColor(WHITE);
+        M5.Display.print(" ");
+        M5.Display.print(durStr);
       } else {
         M5.Display.setTextColor(WHITE);
         M5.Display.print(trackedDevices[i].totalCount);
@@ -1255,9 +1279,18 @@ void displayMenuScreen() {
   int batPercent = (int)((batVoltage - 3.0f) / 1.2f * 100.0f);
   if (batPercent > 100) batPercent = 100;
   if (batPercent < 0) batPercent = 0;
+  float estHoursRemaining = (batPercent / 100.0f) * TYPICAL_BATTERY_LIFE_HOURS;
   M5.Display.print("Bat:");
   M5.Display.print(batPercent);
-  M5.Display.print("% Bright:");
+  M5.Display.print("% (~");
+  if (estHoursRemaining >= 1.0f) {
+    M5.Display.print(estHoursRemaining, 1);
+    M5.Display.print("h)");
+  } else {
+    M5.Display.print((int)(estHoursRemaining * 60));
+    M5.Display.print("m)");
+  }
+  M5.Display.print(" Br:");
   M5.Display.print(highBrightness ? "Hi" : "Lo");
   y += 12;
 
@@ -1494,9 +1527,14 @@ void handleBtnB() {
       }
     }
   } else {
-    filterByName = !filterByName;
-    showFeedback(filterByName ? "NAMED ONLY" : "SHOW ALL",
-                 filterByName ? CYAN : ORANGE);
+    filterMode = (FilterMode)((filterMode + 1) % 3);
+    const char *label = filterMode == FILTER_NAMED ? "NAMED ONLY"
+                       : filterMode == FILTER_ALERTS ? "ALERTS ONLY"
+                       : "SHOW ALL";
+    uint16_t color = filterMode == FILTER_NAMED ? CYAN
+                    : filterMode == FILTER_ALERTS ? RED
+                    : ORANGE;
+    showFeedback(label, color);
     delay(800);
     lastStateHash = 0;
     lastDisplayRender = 0;

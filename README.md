@@ -79,7 +79,7 @@ PathShield is an RF awareness tool for the M5StickS3. It uses BLE/WiFi scanning 
 ### Normal Scanning Mode
 ```
 Button A:   Pause scanning
-Button B:   Toggle name filter
+Button B:   Cycle filter (Show All -> Named Only -> Alerts Only)
 A+B (hold): Settings menu
 ```
 
@@ -117,6 +117,8 @@ Each device shows:
 Device Name (BLE) or SSID (WiFi)
 Manufacturer (identified from MAC)
 Detection Count + Signal Strength (RSSI)
+  -- or, once flagged as a suspected tracker --
+Alert Score + Duration Since First Seen (e.g. "!0.82 3m")
 ```
 
 ### Color Codes
@@ -129,8 +131,8 @@ GREEN   = Scan active, status messages
 ```
 
 ### Filter Mode
-- Press **Button B** to toggle between "Show All" (all devices) and "Named Only" (only named devices)
-- Useful for cutting through noise when there are many unnamed devices
+- Press **Button B** to cycle: "Show All" -> "Named Only" (hides unnamed/noise devices) -> "Alerts Only" (only currently-flagged/suspected trackers) -> back to "Show All"
+- Useful for cutting through noise when there are many unnamed devices, or jumping straight to what's currently flagged
 
 ### Footer
 - **Page counter**: Shows which page you're viewing (e.g., "1-3/23")
@@ -355,6 +357,8 @@ unethical use. Review local regulations before deployment.
 ## Contributing
 
 Issues and pull requests welcome. Test thoroughly before submitting.
+
+See [ROADMAP.md](ROADMAP.md) for planned UX/product enhancements, phased by impact.
 
 ## Support
 
