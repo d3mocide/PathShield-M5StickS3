@@ -62,11 +62,17 @@ checklist.
 
 ## Phase 3 — High Impact (larger scope, more design/validation risk)
 
-- [ ] **No-reflash configuration.** Allowlist/specialMacs/sensitivity thresholds
-  currently require editing `PathShield.ino` and reflashing via Arduino IDE. A
-  serial command protocol or temporary WiFi-AP config page would let someone
-  configure the device without a toolchain — the single change most likely to
-  widen who can actually use this device, and the biggest lift on this list.
+- [x] **No-reflash configuration.** Shipped as a line-based serial command
+  console (`help`, `special list/add/remove/reset`, `allow list/add/remove`,
+  `threshold list/set/reset`, `dump`, `config`) over the existing USB-serial
+  connection, persisted to SPIFFS immediately. Chose serial over a temporary
+  WiFi-AP config page: this is an anti-stalking device whose Quiet mode
+  exists specifically to avoid drawing attention, so having it broadcast a
+  discoverable WiFi AP for configuration would cut against its own purpose —
+  serial requires physical USB access and stays silent on RF. Widened scope
+  slightly beyond just "allowlist/specialMacs/thresholds": also added
+  allowlist *removal* (`allow remove`), which didn't exist in any form
+  before — the Button-A-hold gesture could only add.
 - [ ] **IMU-based motion correlation.** The StickS3's BMI270 6-axis IMU is
   currently unused. Correlating tracker RSSI drift against the wearer's actual
   motion (rather than RSSI variance alone, today's rough proxy) could meaningfully

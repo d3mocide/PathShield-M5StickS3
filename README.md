@@ -26,11 +26,12 @@ PathShield is an RF awareness tool for the M5StickS3. It uses BLE/WiFi scanning 
 3. [Controls](#controls)
 4. [Display Guide](#display-guide)
 5. [Detection Algorithm](#detection-algorithm)
-6. [Customization](#customization)
-7. [Troubleshooting](#troubleshooting)
-8. [Known Limitations](#known-limitations)
-9. [Credits](#credits)
-10. [License](#license)
+6. [No-Reflash Configuration](#no-reflash-configuration)
+7. [Customization](#customization)
+8. [Troubleshooting](#troubleshooting)
+9. [Known Limitations](#known-limitations)
+10. [Credits](#credits)
+11. [License](#license)
 
 
 ## Features
@@ -47,9 +48,7 @@ PathShield is an RF awareness tool for the M5StickS3. It uses BLE/WiFi scanning 
 
 
 > [!TIP]
-> Modify `allowlistMacs` to ignore known devices.
->
-> Change the `specialMacs` to your own target devices (default detects Flock and Axon Taser cameras).
+> Configure the allowlist, target MAC prefixes, and sensitivity thresholds over USB serial — no reflash needed. See [No-Reflash Configuration](#no-reflash-configuration).
 
 ## Installation
 
@@ -96,7 +95,10 @@ screen — it disappears from the list immediately and won't be tracked again.
 Useful for killing a false positive (your own phone, earbuds, car) on the
 spot, without editing `allowlistMacs[]` and reflashing. Only works on BLE
 devices (not the WiFi list), and matches the exact MAC shown, not the whole
-manufacturer. The allowlist persists across reboots (`/allowlist.txt`).
+manufacturer. The allowlist persists across reboots (`/allowlist.txt`). To
+remove an entry later, or to allowlist a MAC you already know without
+waiting for it to show up on screen, use the `allow` serial command — see
+[No-Reflash Configuration](#no-reflash-configuration).
 
 ### Settings Menu
 ```
@@ -109,7 +111,7 @@ A+B hold:  Exit menu
 - **Toggle Brightness**: Low/High (saves battery on low brightness)
 - **Set Screen Timeout**: How long before screen turns off when idle (10-300 seconds)
 - **Alert Mode**: Cycles Loud+Sound / Loud+Mute / Quiet+Sound / Quiet+Mute. Quiet mode skips the full-screen red/blue strobe (a small bordered indicator instead) and doesn't force max brightness — useful when a flashing screen would draw the wrong kind of attention. Sound plays a short double-beep on alert via the StickS3's onboard speaker.
-- **Export Incident**: Writes a timestamped snapshot of currently-alerting devices to `/incidents.txt` on SPIFFS. Deliberate/on-demand only — nothing is logged automatically. Retrieve it by opening Serial Monitor (115200 baud) and sending `d`.
+- **Export Incident**: Writes a timestamped snapshot of currently-alerting devices to `/incidents.txt` on SPIFFS. Deliberate/on-demand only — nothing is logged automatically. Retrieve it by opening Serial Monitor (115200 baud, newline line ending) and sending `dump`.
 - **Clear Devices**: Clears all tracked devices from memory
 - **Shutdown**: Power off the device
 
@@ -205,17 +207,71 @@ This layered approach works because trackers must advertise these identifiers to
 - Signal strength variations
 - Movement correlation
 
-**Alert Threshold: ≥ 0.65**
+**Alert Threshold: ≥ 0.75 by default** — configurable without reflashing, see below.
 
+
+
+## No-Reflash Configuration
+
+Allowlist entries, target MAC prefixes, and sensitivity thresholds can all be
+changed over USB serial while the device is running — no Arduino IDE, no
+reflash. This is deliberately serial-only rather than a WiFi config page:
+PathShield is an anti-stalking device (Quiet mode exists specifically so it
+doesn't draw attention), so it shouldn't itself broadcast a discoverable
+WiFi access point. Serial requires physical USB access and stays silent on
+RF.
+
+**Connect:** Open a Serial Monitor at 115200 baud with the line ending set
+to **Newline** (or **Both NL & CR**) — commands are dispatched on Enter, not
+per keystroke. Type `help` and press Enter for the full command list.
+
+```
+help                             Show the full command list
+dump                             Print /incidents.txt
+config                           Show full current configuration
+special list                     List privacy-invader MAC prefixes
+special add <prefix>             e.g. special add 00:25:DF
+special remove <index|prefix>    Remove by index (from 'special list') or exact text
+special reset                    Reset to compiled-in defaults
+allow list                       List runtime allowlist (exact MACs)
+allow add <MAC>                  e.g. allow add AA:BB:CC:DD:EE:FF
+allow remove <MAC>               Remove a MAC from the allowlist
+threshold list                   Show sensitivity thresholds
+threshold set <name> <value>     name: persistence | rssi_stability | rssi_variation
+threshold reset                  Reset thresholds to defaults
+```
+
+- `special` manages the same OUI-prefix list as the compiled-in `specialMacs[]`
+  (default: Axon camera / Flock Safety OUIs) — anything matching triggers an
+  immediate "KNOWN" alert. Prefixes only, e.g. `00:25:DF`, not a full MAC.
+- `allow` manages the same runtime allowlist the Button-A-hold gesture writes
+  to (`/allowlist.txt`), but with a remove path and the ability to add a MAC
+  you already know without waiting for it to appear on screen. Requires the
+  full 17-character MAC (`AA:BB:CC:DD:EE:FF`) for an exact match.
+- `threshold set persistence <0.0-1.0>` raises or lowers the alert bar
+  directly (default `0.75`, see [Detection Algorithm](#detection-algorithm)).
+  `rssi_stability`/`rssi_variation` (default `10`/`15` dBm) tune how RSSI
+  swings feed into that score — see [Adjust Sensitivity](#adjust-sensitivity)
+  for what raising/lowering each one trades off.
+
+All changes are written to SPIFFS immediately and persist across reboots —
+equivalent to editing `PathShield.ino` and reflashing, without the toolchain.
 
 
 ## Customization
 
+> [!NOTE]
+> Everything in this section can also be changed live over serial without
+> touching source or reflashing — see [No-Reflash Configuration](#no-reflash-configuration).
+> Editing the values here instead changes the *compiled-in default* a fresh
+> install (or a `special reset` / `threshold reset`) falls back to.
+
 ### Known Tracker MACs
 
-Edit `specialMacs[]` in PathShield.ino:
+Edit `defaultSpecialMacs[]` in PathShield.ino — this seeds the runtime list on
+first boot and whenever `special reset` is used:
 ```cpp
-const char *specialMacs[] = {
+const char *defaultSpecialMacs[] = {
   // Apple OUIs (AirTags use rotating addresses from Apple's OUI space)
   "AC:DE:48",  // Apple Inc.
   "F0:98:9D",  // Apple Inc.
@@ -237,7 +293,11 @@ const char *specialMacs[] = {
 
 ### Allowlist (Trusted Devices)
 
-Add your own trusted devices to `allowlistMacs[]` to prevent false alerts:
+For most cases, use the `allow add <MAC>` serial command or the in-field
+Button-A-hold gesture instead — both allowlist by exact MAC and need no
+reflash. `allowlistMacs[]` in PathShield.ino is a separate, OUI-*prefix*
+compiled-in allowlist for when you want to ignore every device from a given
+manufacturer, not just one:
 
 ```cpp
 const char *allowlistMacs[] = {
@@ -251,16 +311,26 @@ Allowlisted devices are completely ignored during scanning and will never trigge
 
 ### Adjust Sensitivity
 
+The persistence threshold and RSSI thresholds below are runtime-configurable —
+use `threshold set <name> <value>` (see [No-Reflash Configuration](#no-reflash-configuration))
+instead of editing source for these two. `MIN_DETECTIONS` and `MIN_WINDOWS`
+are compile-time only (they change the shape of the scoring algorithm itself,
+not just where its output gets gated).
+
 **More Sensitive (more alerts):**
 ```cpp
-#define PERSISTENCE_THRESHOLD 0.50  // Lower threshold
+threshold set persistence 0.50   // Lower threshold
+```
+```cpp
 #define MIN_DETECTIONS 5            // Fewer detections needed
 #define MIN_WINDOWS 2               // Fewer time windows
 ```
 
 **Less Sensitive (fewer false positives):**
 ```cpp
-#define PERSISTENCE_THRESHOLD 0.75  // Higher threshold
+threshold set persistence 0.75   // Higher threshold (default)
+```
+```cpp
 #define MIN_DETECTIONS 12           // More detections needed
 #define MIN_WINDOWS 4               // More time windows
 ```
@@ -290,12 +360,13 @@ M5.Display.drawFastHLine(0, 0, SCREEN_WIDTH, MAGENTA);  // Border color
 ### No Alerts for Known Tracker
 
 **Solution:**
-1. Lower threshold temporarily:
-```cpp
-#define PERSISTENCE_THRESHOLD 0.40
+1. Lower threshold temporarily over serial (no reflash needed):
+```
+threshold set persistence 0.40
 ```
 2. Check Serial Monitor (115200 baud) for detection counts
 3. Verify tracker is powered on and advertising
+4. `threshold reset` to go back to the default afterward
 
 ### Too Many False Positives
 
@@ -308,16 +379,23 @@ M5.Display.drawFastHLine(0, 0, SCREEN_WIDTH, MAGENTA);  // Border color
 2. Hold **Button A** for 1 second — it's gone and won't be tracked again
 3. No reflash needed; persists across reboots
 
-**Permanent, compiled-in allowlist (for devices you always want ignored)**
+**Also works from a shell, no button gesture needed**
+```
+allow add AA:BB:CC:DD:EE:FF
+```
+Made a mistake, or want it back? `allow remove AA:BB:CC:DD:EE:FF`.
+
+**Permanent, compiled-in default (for devices you always want ignored, even after a fresh flash)**
 1. Note the MAC address from the display
 2. Add to `allowlistMacs[]` in PathShield.ino
 3. Re-upload and restart
 
-**Fine-tune sensitivity (advanced)**
-```cpp
-#define PERSISTENCE_THRESHOLD 0.75  // Raise to be more strict
-#define MIN_DETECTIONS 12           // Require more detections
+**Fine-tune sensitivity**
 ```
+threshold set persistence 0.85       // Raise to be more strict
+threshold set rssi_stability 6       // Require tighter RSSI stability
+```
+(`MIN_DETECTIONS` stays compile-time-only — see [Adjust Sensitivity](#adjust-sensitivity).)
 
 ### Cannot Resume from Pause
 
