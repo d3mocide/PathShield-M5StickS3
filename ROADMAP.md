@@ -28,27 +28,37 @@ checklist.
 
 ## Phase 2 — Medium Impact (new interaction/hardware surface, contained scope)
 
-- [ ] **Discreet alert mode.** A menu toggle to replace the current 5x full-screen
-  red/blue strobe with a quiet variant (small persistent indicator, no strobe) for
-  situations where a flashing screen is the opposite of what you want — this is a
-  personal-safety tool, and drawing attention to the fact you're checking for a
-  tracker can itself be a risk.
-- [ ] **Speaker tone on alert.** The StickS3 has an ES8311 codec + speaker that this
-  firmware never touches (`M5.Speaker` is unused). Add a short configurable tone
-  (on/off, maybe volume) as an alert channel independent of the screen — useful
-  alongside or instead of discreet mode.
-- [ ] **Flag/allowlist a device from the paused findings list.** Currently the only
-  way to add a device to `specialMacs[]`/`allowlistMacs[]` is editing the source and
-  reflashing (the README's own troubleshooting section says as much). A long-press
-  on the selected device while paused to allowlist it (kill a false positive) or
-  flag it (watch more closely) removes a real friction point — the single biggest
-  gap between "tool you compile" and "tool a non-engineer can use in the field."
-- [ ] **On-demand "Export Incident" menu action.** Distinct from the passive
-  `/devices.txt` logging we removed (write-only, never read, no product value) —
-  this is a deliberate, user-triggered snapshot of currently-alerting devices
-  (MAC, manufacturer, score, duration) written to SPIFFS for later retrieval.
-  Real value for someone who might need to show a record to police or in a
-  protective-order filing.
+- [x] **Discreet alert mode + speaker tone.** Combined into one 4-state "Alert
+  Mode" menu cycle (Loud+Sound → Loud+Mute → Quiet+Sound → Quiet+Mute) rather
+  than two independent toggles, to save a menu row on a screen that was
+  already nearly full at 4 options. Quiet mode replaces the 5x full-screen
+  red/blue strobe with a black screen + thin colored border, and no longer
+  forces max brightness (respects whatever brightness the user already
+  chose) — the point is to not draw attention. Sound uses the StickS3's
+  ES8311 speaker (`M5.Speaker.tone()`, previously unused) for a short
+  double-beep, independent of the visual mode. Persisted to `/prefs.txt`.
+- [x] **Flag/allowlist a device from the paused findings list.** Shipped the
+  allowlist half of this item: hold Button A (1s) on the paused BLE list to
+  allowlist the topmost visible device — exact-MAC match (not an OUI prefix
+  like the compile-time `allowlistMacs[]`, to avoid a quick in-field action
+  accidentally suppressing a different device from the same manufacturer),
+  removes it from the tracked list immediately, persists to
+  `/allowlist.txt`. **Not shipped:** "flag as special/watch more closely" —
+  no clean second long-press gesture was available without overloading
+  Button B's existing hold-to-resume, and allowlisting was the more
+  directly valuable half (it's the one the README's troubleshooting section
+  already flagged as a pain point). Could revisit via the settings menu if
+  it's still wanted.
+- [x] **On-demand "Export Incident" menu action.** Deliberate, user-triggered
+  snapshot of currently-alerting devices (MAC, manufacturer, tracker type,
+  score, first-seen uptime) appended to `/incidents.txt` on SPIFFS —
+  distinct from the passive `/devices.txt` logging removed earlier.
+  Timestamps are uptime-relative (no RTC/NTP on this device), not
+  wall-clock. **Retrieval:** no WiFi/USB export path exists yet (that's
+  Phase 3 territory), so for now the only way to get an export off the
+  device is Serial Monitor (115200 baud) + send `d` to dump the file. Good
+  enough to make the feature actually usable today; a proper retrieval path
+  will likely piggyback on Phase 3's no-reflash-configuration work.
 
 ## Phase 3 — High Impact (larger scope, more design/validation risk)
 

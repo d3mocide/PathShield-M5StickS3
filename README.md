@@ -85,10 +85,18 @@ A+B (hold): Settings menu
 
 ### Paused 
 ```
-Button A:      Scroll up
+Button A:      Scroll up (tap)
+Button A hold: Allowlist the topmost visible device (hold 1 second)
 Button B:      Scroll down (tap)
 Button B hold: Resume (hold 1 second)
 ```
+
+Holding Button A allowlists whichever device is currently at the top of the
+screen — it disappears from the list immediately and won't be tracked again.
+Useful for killing a false positive (your own phone, earbuds, car) on the
+spot, without editing `allowlistMacs[]` and reflashing. Only works on BLE
+devices (not the WiFi list), and matches the exact MAC shown, not the whole
+manufacturer. The allowlist persists across reboots (`/allowlist.txt`).
 
 ### Settings Menu
 ```
@@ -98,10 +106,12 @@ A+B hold:  Exit menu
 ```
 
 **Available Settings:**
-- **Brightness**: Low/High (saves battery on low brightness)
+- **Toggle Brightness**: Low/High (saves battery on low brightness)
+- **Set Screen Timeout**: How long before screen turns off when idle (10-300 seconds)
+- **Alert Mode**: Cycles Loud+Sound / Loud+Mute / Quiet+Sound / Quiet+Mute. Quiet mode skips the full-screen red/blue strobe (a small bordered indicator instead) and doesn't force max brightness — useful when a flashing screen would draw the wrong kind of attention. Sound plays a short double-beep on alert via the StickS3's onboard speaker.
+- **Export Incident**: Writes a timestamped snapshot of currently-alerting devices to `/incidents.txt` on SPIFFS. Deliberate/on-demand only — nothing is logged automatically. Retrieve it by opening Serial Monitor (115200 baud) and sending `d`.
 - **Clear Devices**: Clears all tracked devices from memory
-- **Display Timeout**: How long before screen turns off when idle (10-300 seconds)
-- **Shutdown Device**: Power off the device
+- **Shutdown**: Power off the device
 
 ## Display Guide
 
@@ -293,7 +303,12 @@ M5.Display.drawFastHLine(0, 0, SCREEN_WIDTH, MAGENTA);  // Border color
 - Press **Button B** to show only named devices
 - Hides random MAC addresses and noise
 
-**Persistent false positives: Add to allowlist**
+**Fastest fix: Allowlist it in the field**
+1. Press **Button A** to pause, scroll until the device is at the top
+2. Hold **Button A** for 1 second — it's gone and won't be tracked again
+3. No reflash needed; persists across reboots
+
+**Permanent, compiled-in allowlist (for devices you always want ignored)**
 1. Note the MAC address from the display
 2. Add to `allowlistMacs[]` in PathShield.ino
 3. Re-upload and restart

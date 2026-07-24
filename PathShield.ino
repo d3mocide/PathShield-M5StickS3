@@ -55,12 +55,15 @@ const unsigned long DEBOUNCE_DELAY = 200;
 bool inMenu = false;
 int menuIndex = 0;
 int menuBaseY = 0;
+#define MENU_OPTION_COUNT 6
 
 bool highBrightness = true;
 bool currentlyBright = true;
 bool paused = false;
 enum FilterMode { FILTER_ALL, FILTER_NAMED, FILTER_ALERTS };
 FilterMode filterMode = FILTER_ALL;
+bool discreetAlerts = false;
+bool alertSoundEnabled = true;
 bool screenDimmed = false;
 unsigned long lastButtonPressTime = 0;
 unsigned long lastActivityTime = 0;
@@ -148,6 +151,21 @@ void formatDuration(unsigned long seconds, char *out, size_t outSize) {
 // Leave as {""} to track all devices
 const char *allowlistMacs[] = {""};
 
+// Runtime allowlist — devices added in the field (hold Button A on the
+// paused findings list) rather than compiled in. Exact full-MAC match, not
+// an OUI prefix like allowlistMacs[] above: a quick in-field action should
+// suppress the one device you're looking at, not silently widen to every
+// device from that manufacturer. Persisted to /allowlist.txt.
+#define MAX_RUNTIME_ALLOWLIST 20
+char runtimeAllowlist[MAX_RUNTIME_ALLOWLIST][18];
+int runtimeAllowlistCount = 0;
+
+// Topmost device on the currently-rendered paused BLE list, cached by
+// displayTrackedDevices() so handleBtnA()'s hold-to-allowlist gesture acts on
+// exactly what the user is looking at.
+char topVisibleAddress[18] = "";
+bool topVisibleValid = false;
+
 struct TimeWindow {
   unsigned long start;
   unsigned long end;
@@ -225,6 +243,11 @@ bool isAllowlistedMac(const char *address) {
   for (size_t i = 0; i < sizeof(allowlistMacs) / sizeof(allowlistMacs[0]); i++) {
     if (strlen(allowlistMacs[i]) > 0 &&
         strncmp(address, allowlistMacs[i], strlen(allowlistMacs[i])) == 0) {
+      return true;
+    }
+  }
+  for (int i = 0; i < runtimeAllowlistCount; i++) {
+    if (strcmp(address, runtimeAllowlist[i]) == 0) {
       return true;
     }
   }
@@ -717,9 +740,25 @@ void alertUser(bool isSpecial, const char *name, const char *mac,
 
   screenOn = true;
   lastActivityTime = millis();
-  M5.Display.setBrightness(204);
+  // Loud mode always jumps to max brightness to grab attention. Discreet mode
+  // respects whatever brightness the user already chose — the point is to
+  // not draw attention, so don't force the screen bright either.
+  M5.Display.setBrightness(discreetAlerts ? (highBrightness ? 204 : 77) : 204);
 
-  if (isSpecial) {
+  if (alertSoundEnabled) {
+    M5.Speaker.tone(1800, 120);
+    delay(160);
+    M5.Speaker.tone(1800, 120);
+    delay(160);
+  }
+
+  if (discreetAlerts) {
+    // Quiet variant: no strobe, just a black screen with a thin colored
+    // border — enough to notice without drawing attention to the device.
+    M5.Display.fillScreen(BLACK);
+    M5.Display.drawRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, isSpecial ? ORANGE : RED);
+    M5.Display.drawRect(1, 1, SCREEN_WIDTH - 2, SCREEN_HEIGHT - 2, isSpecial ? ORANGE : RED);
+  } else if (isSpecial) {
     for (int i = 0; i < 5; i++) {
       M5.Display.fillScreen(RED);
       delay(200);
@@ -731,9 +770,9 @@ void alertUser(bool isSpecial, const char *name, const char *mac,
   }
 
   M5.Display.setCursor(0, 10);
-  M5.Display.setTextColor(WHITE);
+  M5.Display.setTextColor(discreetAlerts ? (isSpecial ? ORANGE : RED) : WHITE);
   M5.Display.setTextSize(2);
-  M5.Display.print("Tracker Detected!");
+  M5.Display.print(discreetAlerts ? "Tracker Alert" : "Tracker Detected!");
   M5.Display.setTextSize(1);
 
   M5.Display.setCursor(0, 40);
@@ -1039,6 +1078,10 @@ void displayTrackedDevices() {
   int totalItems = 0;
 
   if (scanningWiFi) {
+    // Allowlisting only applies to BLE devices — never act on a stale BLE
+    // address while a WiFi list is on screen.
+    topVisibleValid = false;
+
     totalItems = wifiDeviceIndex;
     for (int i = scrollIndex; i < wifiDeviceIndex && displayed < maxDisplay;
          i++, displayed++) {
@@ -1132,6 +1175,14 @@ void displayTrackedDevices() {
     }
 
     totalItems = filteredCount;
+
+    if (filteredCount > 0 && scrollIndex < filteredCount) {
+      strncpy(topVisibleAddress, trackedDevices[sortedIndices[scrollIndex]].address, 17);
+      topVisibleAddress[17] = '\0';
+      topVisibleValid = true;
+    } else {
+      topVisibleValid = false;
+    }
 
     for (int idx = scrollIndex; idx < filteredCount && displayed < maxDisplay;
          idx++, displayed++) {
@@ -1294,17 +1345,15 @@ void displayMenuScreen() {
   M5.Display.print(highBrightness ? "Hi" : "Lo");
   y += 12;
 
+  // Compact: Timeout/RAM/Tracked share one line so 6 menu rows still fit
+  // this screen's 135px height.
   M5.Display.setCursor(2, y);
-  M5.Display.print("Timeout:");
+  M5.Display.print("T:");
   M5.Display.print(screenTimeoutMs / 1000);
-  M5.Display.print("s Tracked:");
-  M5.Display.print(deviceIndex);
-  y += 12;
-
-  M5.Display.setCursor(2, y);
-  M5.Display.print("RAM:");
+  M5.Display.print("s RAM:");
   M5.Display.print(ESP.getFreeHeap() / 1024);
-  M5.Display.print("KB");
+  M5.Display.print("K Trk:");
+  M5.Display.print(deviceIndex);
   y += 16;
 
   M5.Display.drawLine(0, y, SCREEN_WIDTH, y, DARKGREY);
@@ -1320,6 +1369,14 @@ void displayMenuScreen() {
 
   M5.Display.setCursor(10, y);
   M5.Display.print("Set Screen Timeout");
+  y += 11;
+
+  M5.Display.setCursor(10, y);
+  M5.Display.print("Alert Mode");
+  y += 11;
+
+  M5.Display.setCursor(10, y);
+  M5.Display.print("Export Incident");
   y += 11;
 
   M5.Display.setCursor(10, y);
@@ -1339,7 +1396,7 @@ void displayMenuScreen() {
 }
 
 void highlightMenuOption(int index) {
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < MENU_OPTION_COUNT; i++) {
     M5.Display.setCursor(2, menuBaseY + (i * 11));
     M5.Display.setTextColor(BLACK);
     M5.Display.print(">");
@@ -1360,6 +1417,10 @@ void saveUserPreferences() {
   file.println(highBrightness ? "1" : "0");
   file.print("timeout=");
   file.println(screenTimeoutMs);
+  file.print("discreet=");
+  file.println(discreetAlerts ? "1" : "0");
+  file.print("sound=");
+  file.println(alertSoundEnabled ? "1" : "0");
 
   file.close();
 }
@@ -1378,10 +1439,77 @@ void loadUserPreferences() {
       highBrightness = line.substring(11).toInt() == 1;
     } else if (line.startsWith("timeout=")) {
       screenTimeoutMs = line.substring(8).toInt();
+    } else if (line.startsWith("discreet=")) {
+      discreetAlerts = line.substring(9).toInt() == 1;
+    } else if (line.startsWith("sound=")) {
+      alertSoundEnabled = line.substring(6).toInt() == 1;
     }
   }
 
   file.close();
+}
+
+void saveRuntimeAllowlist() {
+  File file = SPIFFS.open("/allowlist.txt", FILE_WRITE);
+  if (!file) {
+    return;
+  }
+  for (int i = 0; i < runtimeAllowlistCount; i++) {
+    file.println(runtimeAllowlist[i]);
+  }
+  file.close();
+}
+
+void loadRuntimeAllowlist() {
+  File file = SPIFFS.open("/allowlist.txt", FILE_READ);
+  if (!file) {
+    return; // File doesn't exist, nothing allowlisted yet
+  }
+
+  while (file.available() && runtimeAllowlistCount < MAX_RUNTIME_ALLOWLIST) {
+    String line = file.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0) {
+      strncpy(runtimeAllowlist[runtimeAllowlistCount], line.c_str(), 17);
+      runtimeAllowlist[runtimeAllowlistCount][17] = '\0';
+      runtimeAllowlistCount++;
+    }
+  }
+
+  file.close();
+}
+
+// Allowlists a device in the field and makes it disappear from the tracked
+// list immediately — not just "won't alert again", but gone from view now,
+// same as if it had never been seen. isAllowlistedMac() then keeps it out
+// going forward.
+bool allowlistDevice(const char *address) {
+  if (runtimeAllowlistCount >= MAX_RUNTIME_ALLOWLIST) {
+    return false;
+  }
+
+  if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+    return false;
+  }
+
+  strncpy(runtimeAllowlist[runtimeAllowlistCount], address, 17);
+  runtimeAllowlist[runtimeAllowlistCount][17] = '\0';
+  runtimeAllowlistCount++;
+
+  for (int i = 0; i < deviceIndex; i++) {
+    if (strcmp(trackedDevices[i].address, address) == 0) {
+      for (int j = i; j < deviceIndex - 1; j++) {
+        trackedDevices[j] = trackedDevices[j + 1];
+      }
+      deviceIndex--;
+      break;
+    }
+  }
+  scrollIndex = 0;
+
+  xSemaphoreGive(deviceMutex);
+  saveRuntimeAllowlist();
+  return true;
 }
 
 void toggleBrightness() {
@@ -1389,6 +1517,52 @@ void toggleBrightness() {
   M5.Display.setBrightness(highBrightness ? 204 : 77);
   lastButtonPressTime = millis();
   saveUserPreferences();
+}
+
+// Deliberate, user-triggered snapshot of currently-alerting devices — distinct
+// from the passive per-scan logging removed earlier. Appends so multiple
+// incidents across a session (or across power cycles) build a record.
+// No RTC/NTP on this device, so timestamps are uptime-relative, not wall-clock.
+int exportIncident() {
+  if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+    return 0;
+  }
+
+  File file = SPIFFS.open("/incidents.txt", FILE_APPEND);
+  if (!file) {
+    xSemaphoreGive(deviceMutex);
+    return 0;
+  }
+
+  file.print("=== Incident export at uptime ");
+  file.print(millis() / 1000);
+  file.println("s ===");
+
+  int count = 0;
+  for (int i = 0; i < deviceIndex; i++) {
+    if (!trackedDevices[i].detected) continue;
+    file.print(trackedDevices[i].address);
+    file.print(",");
+    file.print(strlen(trackedDevices[i].name) > 0 ? trackedDevices[i].name : "Unknown");
+    file.print(",");
+    file.print(trackedDevices[i].manufacturer);
+    file.print(",");
+    file.print(trackerTypeName(trackedDevices[i].trackerType));
+    file.print(",score=");
+    file.print(trackedDevices[i].persistenceScore, 2);
+    file.print(",firstSeenUptime=");
+    file.print(trackedDevices[i].firstSeen);
+    file.print(",totalCount=");
+    file.println(trackedDevices[i].totalCount);
+    count++;
+  }
+  if (count == 0) {
+    file.println("(no currently-alerting devices)");
+  }
+
+  file.close();
+  xSemaphoreGive(deviceMutex);
+  return count;
 }
 
 void clearDevices() {
@@ -1400,6 +1574,24 @@ void clearDevices() {
   scrollIndex = 0;
 
   xSemaphoreGive(deviceMutex);
+}
+
+// Serial retrieval for exported incidents — send 'd' over Serial Monitor
+// (115200 baud) to dump /incidents.txt. No WiFi/USB-storage export path
+// exists yet (that's Phase 3 territory), so this is the only way to get
+// exported incidents off the device today.
+void dumpIncidentsToSerial() {
+  File file = SPIFFS.open("/incidents.txt", FILE_READ);
+  if (!file) {
+    Serial.println("No incidents exported yet.");
+    return;
+  }
+  Serial.println("--- BEGIN /incidents.txt ---");
+  while (file.available()) {
+    Serial.write(file.read());
+  }
+  Serial.println("--- END /incidents.txt ---");
+  file.close();
 }
 
 void shutdownDevice() {
@@ -1426,11 +1618,22 @@ void executeMenuOption(int index) {
       cycleScreenTimeout();
       break;
     case 2:
+      cycleAlertMode();
+      break;
+    case 3: {
+      int exported = exportIncident();
+      char msg[16];
+      snprintf(msg, sizeof(msg), "%d EXPORTED", exported);
+      showFeedback(msg, exported > 0 ? GREEN : DARKGREY);
+      delay(1000);
+      break;
+    }
+    case 4:
       clearDevices();
       showFeedback("CLEARED", GREEN);
       delay(1000);
       break;
-    case 3:
+    case 5:
       shutdownDevice();
       return;
   }
@@ -1462,6 +1665,30 @@ void cycleScreenTimeout() {
   delay(1000);
 }
 
+// 4-state cycle: Loud+Sound -> Loud+Mute -> Quiet+Sound -> Quiet+Mute -> repeat.
+// Combined into one setting (rather than two independent toggles) to save a
+// menu row on a screen that's already tight on vertical space.
+void cycleAlertMode() {
+  if (!discreetAlerts && alertSoundEnabled) {
+    alertSoundEnabled = false;
+  } else if (!discreetAlerts && !alertSoundEnabled) {
+    discreetAlerts = true;
+    alertSoundEnabled = true;
+  } else if (discreetAlerts && alertSoundEnabled) {
+    alertSoundEnabled = false;
+  } else {
+    discreetAlerts = false;
+    alertSoundEnabled = true;
+  }
+  saveUserPreferences();
+
+  const char *label = discreetAlerts
+                           ? (alertSoundEnabled ? "QUIET+SOUND" : "QUIET+MUTE")
+                           : (alertSoundEnabled ? "LOUD+SOUND" : "LOUD+MUTE");
+  showFeedback(label, discreetAlerts ? CYAN : ORANGE);
+  delay(1000);
+}
+
 bool checkButtonCombo() {
   unsigned long currentMillis = millis();
 
@@ -1479,9 +1706,35 @@ void handleBtnA() {
   lastActivityTime = millis();
 
   if (paused) {
-    if (scrollIndex > 0) {
+    unsigned long pressStart = millis();
+
+    while (M5.BtnA.isPressed() && (millis() - pressStart < 1000)) {
+      M5.update();
+      delay(10);
+    }
+
+    if (millis() - pressStart >= 1000) {
+      // Long-press: allowlist the topmost visible device — kills a false
+      // positive on the spot, no reflash needed. BLE-only (see topVisibleValid).
+      if (topVisibleValid) {
+        char allowedAddr[18];
+        strncpy(allowedAddr, topVisibleAddress, 17);
+        allowedAddr[17] = '\0';
+        if (allowlistDevice(allowedAddr)) {
+          showFeedback("ALLOWLISTED", GREEN, allowedAddr);
+        } else {
+          showFeedback("ALLOW FULL", RED);
+        }
+      } else {
+        showFeedback("NOTHING", DARKGREY);
+      }
+      delay(1200);
+      lastStateHash = 0;
+      lastDisplayRender = 0;
+      displayTrackedDevices();
+    } else if (scrollIndex > 0) {
       scrollIndex--;
-      lastStateHash = 0; 
+      lastStateHash = 0;
       lastDisplayRender = 0;
       displayTrackedDevices();
     }
@@ -1860,6 +2113,9 @@ void setup() {
   currentlyBright = highBrightness;
   Serial.print("User preferences loaded - Brightness: ");
   Serial.println(highBrightness ? "High" : "Low");
+
+  loadRuntimeAllowlist();
+  Serial.printf("Runtime allowlist loaded: %d device(s)\n", runtimeAllowlistCount);
   Serial.print("Screen Timeout: ");
   Serial.println(screenTimeoutMs);
 
@@ -1939,6 +2195,13 @@ void loop() {
   const unsigned long MEMORY_CHECK_INTERVAL = 5000;
 
   M5.update();
+
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'd' || c == 'D') {
+      dumpIncidentsToSerial();
+    }
+  }
 
   // Tracker alert deposited by scanTask (Core 0) — render and wait for
   // dismissal here on Core 1, the only task allowed to touch the display/buttons.
@@ -2040,7 +2303,7 @@ void loop() {
       // MENU MODE
       if (btnA && (currentMillis - lastBtnAPress > DEBOUNCE_DELAY)) {
         lastBtnAPress = currentMillis;
-        menuIndex = (menuIndex + 1) % 4;
+        menuIndex = (menuIndex + 1) % MENU_OPTION_COUNT;
         highlightMenuOption(menuIndex);
         return;
       }
