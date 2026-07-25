@@ -325,7 +325,7 @@
 | |   | | | | | | | | | /\__/ / | | |_| |_| |___| |___| |_| |
 \_|   \_| |_/ \_/ \_| |_\____/\_| |_/\___/\____/\_____/____/ 
       </div>
-      <div class="tagline">TRACKER DETECTION SYSTEM v2.2.0</div>
+      <div class="tagline">TRACKER DETECTION SYSTEM <span id="fw-version">v2.4.1</span></div>
     </div>
 
     <div class="section">
@@ -397,5 +397,19 @@
       For security research and privacy protection only
     </div>
   </div>
+
+  <script>
+    // Read the version straight out of the manifest the install button uses,
+    // so the page can never advertise a different build than it installs.
+    // The hardcoded value above is only a fallback for when this fetch fails.
+    fetch('./manifest.json', { cache: 'no-cache' })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (m) {
+        if (m && m.version) {
+          document.getElementById('fw-version').textContent = 'v' + m.version;
+        }
+      })
+      .catch(function () { /* keep the fallback already in the markup */ });
+  </script>
 </body>
 </html>

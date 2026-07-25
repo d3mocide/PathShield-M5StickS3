@@ -10,6 +10,13 @@
 #define SCREEN_HEIGHT 135
 #define DEFAULT_SCREEN_TIMEOUT 30000
 
+// Single source of truth for the version. Shown on the boot splash, in the
+// settings header, and over serial at boot, so you can confirm on-device which
+// build is actually running. Keep this in step with docs/manifest.json —
+// including the cache-busting `?v=` on its firmware paths, or the web flasher
+// will happily reinstall a stale binary from CDN cache.
+#define FIRMWARE_VERSION "2.4.1"
+
 // M5StickS3 always has 8MB PSRAM, so device limits are fixed at boot.
 #define MAX_DEVICES_CAP 70
 #define MAX_WIFI_DEVICES_CAP 50
@@ -1008,7 +1015,7 @@ void displayStartupMessage() {
 
   M5.Display.setTextColor(DARKGREY);
   M5.Display.setCursor(85, 72);
-  M5.Display.print("v2.4.0");
+  M5.Display.print("v" FIRMWARE_VERSION);
 
   M5.Display.drawFastHLine(0, 85, SCREEN_WIDTH, MAGENTA);
 
@@ -1516,6 +1523,12 @@ void displayMenuScreen() {
   M5.Display.setTextColor(GREEN);
   M5.Display.setTextSize(1);
   M5.Display.print("SETTINGS");
+
+  // The splash flashes past in a couple of seconds; this is the version you
+  // can go and look up at any time to confirm what's actually flashed.
+  M5.Display.setTextColor(DARKGREY);
+  M5.Display.setCursor(SCREEN_WIDTH - 4 - (int)(strlen(FIRMWARE_VERSION) + 1) * 6, 2);
+  M5.Display.print("v" FIRMWARE_VERSION);
 
   M5.Display.drawLine(0, 12, SCREEN_WIDTH, 12, DARKGREY);
 
@@ -2518,7 +2531,7 @@ void scanTask(void *parameter) {
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("Starting setup...");
+  Serial.println("PathShield v" FIRMWARE_VERSION " — starting setup...");
 
   M5.begin();
   Serial.println("M5 initialized");

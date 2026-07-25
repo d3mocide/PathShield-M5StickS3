@@ -1,25 +1,25 @@
 {
   "name": "PathShield — M5StickS3",
-  "version": "2.4.0",
+  "version": "2.4.1",
   "new_install_prompt_erase": true,
   "builds": [
     {
       "chipFamily": "ESP32-S3",
       "parts": [
         {
-          "path": "bootloader.bin",
+          "path": "bootloader.bin?v=2.4.1",
           "offset": 0
         },
         {
-          "path": "partitions.bin",
+          "path": "partitions.bin?v=2.4.1",
           "offset": 32768
         },
         {
-          "path": "boot_app0.bin",
+          "path": "boot_app0.bin?v=2.4.1",
           "offset": 57344
         },
         {
-          "path": "firmware.bin",
+          "path": "firmware.bin?v=2.4.1",
           "offset": 65536
         }
       ]
