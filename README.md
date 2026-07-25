@@ -53,12 +53,20 @@ PathShield is an RF awareness tool for the M5StickS3. It uses BLE/WiFi scanning 
 ## Installation
 
 ### Web Flasher
-[Install PathShield](https://d3mocide.github.io/pathshield-m5sticks3/)
+[Install PathShield](https://d3mocide.github.io/PathShield-M5StickS3/)
 
 1. Open link in Chrome, Edge, or Opera (not Safari/Firefox)
 2. Connect M5StickS3 via USB-C
 3. Click "Deploy Firmware"
 4. Select serial port, wait ~2 minutes
+
+The page shows the version it will install (read live from `manifest.json`).
+To confirm what actually landed on the device, check the boot splash, or open
+**Settings** (hold Button B) — the version is in the top-right corner.
+
+> [!NOTE]
+> The URL is case-sensitive. `d3mocide.github.io/pathshield-m5sticks3/` (all
+> lowercase) does **not** work — it redirects to a 404.
 
 ### From Source (Arduino IDE)
 
@@ -361,6 +369,27 @@ M5.Display.drawFastHLine(0, 0, SCREEN_WIDTH, MAGENTA);  // Border color
 ```
 
 ## Troubleshooting
+
+### Web Flasher Installed an Old Version
+
+GitHub Pages serves `firmware.bin` with a **4-hour** cache lifetime
+(`Cache-Control: max-age=14400`), and Cloudflare caches it at the edge on top
+of that — while `manifest.json` is only cached for 10 minutes. So the flasher
+could read a fresh manifest claiming the new version and then install a stale
+binary straight out of cache.
+
+The manifest now appends a `?v=<version>` query string to every binary path,
+which makes each release a distinct URL that no cache can satisfy from a
+previous one. **When cutting a release, bump the version in all three places
+or this comes back:** `FIRMWARE_VERSION` in `PathShield.ino`, and both the
+`version` field *and* every `?v=` in `docs/manifest.json`.
+
+To confirm what's actually on the device: the boot splash shows the version,
+and so does the top-right corner of the settings screen (hold Button B). If
+those disagree with what the flasher page advertised, hard-reload the flasher
+page (Ctrl/Cmd+Shift+R) and flash again.
+
+Also check the URL casing — see [Installation](#installation).
 
 ### No Alerts for Known Tracker
 
