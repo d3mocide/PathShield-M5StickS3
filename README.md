@@ -75,51 +75,51 @@ PathShield is an RF awareness tool for the M5StickS3. It uses BLE/WiFi scanning 
 
 ## Controls
 
-### Normal Scanning Mode
+Every gesture is a **tap** or a **hold** (about 1 second) on a single button.
+There is no two-button chord. The same cheat sheet is printed on the device
+itself — it's shown for a few seconds at boot, and is available any time from
+**Settings -> Show Controls**. Over serial, send `controls` to print it.
+
+### Scanning / List
 ```
-Button A:   Pause scanning
-Button B:   Cycle filter (Show All -> Named Only -> Alerts Only)
-A+B (hold): Settings menu
+Button A (tap):   Scroll the list (wraps around at the end)
+Button B (tap):   Cycle filter (All -> Named -> Alerts -> All)
+Button A (hold):  Stop / start scanning
+Button B (hold):  Open the settings menu
 ```
 
-### Paused 
-```
-Button A:      Scroll up (tap)
-Button A hold: Allowlist the topmost visible device (hold 1 second)
-Button B:      Scroll down (tap)
-Button B hold: Resume (hold 1 second)
-```
-
-Holding Button A allowlists whichever device is currently at the top of the
-screen — it disappears from the list immediately and won't be tracked again.
-Useful for killing a false positive (your own phone, earbuds, car) on the
-spot, without editing `allowlistMacs[]` and reflashing. Only works on BLE
-devices (not the WiFi list), and matches the exact MAC shown, not the whole
-manufacturer. The allowlist persists across reboots (`/allowlist.txt`). To
-remove an entry later, or to allowlist a MAC you already know without
-waiting for it to show up on screen, use the `allow` serial command — see
-[No-Reflash Configuration](#no-reflash-configuration).
+Hold **A** to stop scanning, hold **A** again to start it back up — the same
+button gates both directions. Hold **B** is the only way into the settings
+menu.
 
 ### Settings Menu
 ```
-Button A:  Navigate options (up/down)
-Button B:  Select option
-A+B hold:  Exit menu
+Button A (tap):   Next option
+Button B (tap):   Select the highlighted option
+Button B (hold):  Close the menu
+```
+
+### Alert Screen
+```
+Either button:    Dismiss the alert
 ```
 
 **Available Settings:**
-- **Toggle Brightness**: Low/High (saves battery on low brightness)
-- **Set Screen Timeout**: How long before screen turns off when idle (10-300 seconds)
-- **Alert Mode**: Cycles Loud+Sound / Loud+Mute / Quiet+Sound / Quiet+Mute. Quiet mode skips the full-screen red/blue strobe (a small bordered indicator instead) and doesn't force max brightness — useful when a flashing screen would draw the wrong kind of attention. Sound plays a short double-beep on alert via the StickS3's onboard speaker.
+- **Alert Style**: Cycles Simple -> Quiet -> Loud. **Simple** (the default) paints one solid red screen with no animation. **Quiet** draws only a thin colored border on a black screen and doesn't force max brightness — for when a lit-up screen would draw the wrong kind of attention. **Loud** is the full-screen red/blue strobe, kept as an opt-in for when you want to be impossible to ignore.
+- **Alert Sound**: On/Off. A short double-beep on alert via the StickS3's onboard speaker, independent of the visual style.
+- **Brightness**: Low/High (saves battery on low brightness)
+- **Screen Timeout**: How long before the screen turns off when idle (10-300 seconds)
+- **Allowlist Top Device**: Allowlists whichever BLE device is at the top of the findings list — it disappears immediately and won't be tracked again. The menu row shows the tail of the MAC it will act on, so you can confirm the target before selecting. Useful for killing a false positive (your own phone, earbuds, car) on the spot, without editing `allowlistMacs[]` and reflashing. BLE only (not the WiFi list), and it matches the exact MAC shown, not the whole manufacturer. Persists across reboots (`/allowlist.txt`). To remove an entry later, or to allowlist a MAC you already know without waiting for it to show up on screen, use the `allow` serial command — see [No-Reflash Configuration](#no-reflash-configuration).
 - **Export Incident**: Writes a timestamped snapshot of currently-alerting devices to `/incidents.txt` on SPIFFS. Deliberate/on-demand only — nothing is logged automatically. Retrieve it by opening Serial Monitor (115200 baud, newline line ending) and sending `dump`.
 - **Clear Devices**: Clears all tracked devices from memory
+- **Show Controls**: Displays the button cheat sheet above
 - **Shutdown**: Power off the device
 
 ## Display Guide
 
 ### Top Status Bar
-- **Scan Mode**: `SCAN` (green = actively scanning), `PAUSE` (red = paused)
-- **WiFi/BLE Indicator**: Current scan mode (WiFi or Bluetooth)
+- **Scan Mode**: `WiFi`/`BLE` (green = actively scanning), `PAUSE` (red = stopped)
+- **WiFi/BLE Indicator**: Which list is currently on screen
 - **Battery Bar**: Device battery percentage (0-100%)
 - **Memory Bar**: Available RAM in KB (green = good, yellow = warning, red = critical)
 
@@ -143,10 +143,15 @@ GREEN   = Scan active, status messages
 ```
 
 ### Filter Mode
-- Press **Button B** to cycle: "Show All" -> "Named Only" (hides unnamed/noise devices) -> "Alerts Only" (only currently-flagged/suspected trackers) -> back to "Show All"
+- Tap **Button B** to cycle: "All" -> "Named" (hides unnamed/noise devices) -> "Alerts" (only currently-flagged/suspected trackers) -> back to "All"
 - Useful for cutting through noise when there are many unnamed devices, or jumping straight to what's currently flagged
+- The active filter is always named in the bottom-left of the screen
+- Filters apply to the BLE list, so **"Named" and "Alerts" pin the screen to BLE** instead of alternating to WiFi every few seconds. Scanning still covers both bands the whole time — only the view is pinned, so a filtered screen keeps showing the thing you filtered for rather than flipping back to an unfiltered WiFi list
+- If nothing matches yet, the screen says so ("No alerts", plus how many BLE devices are being tracked) rather than going blank
 
 ### Footer
+- **Filter tag**: The filter currently applied (`ALL`, `NAMED`, `ALERTS`)
+- **Hold hints**: `HOLD A:Stop`/`HOLD A:Scan` and `HOLD B:Menu` — the two gestures you can't discover by tapping
 - **Page counter**: Shows which page you're viewing (e.g., "1-3/23")
 - **Scroll hint**: When paused, shows navigation instructions
 
@@ -244,9 +249,9 @@ threshold reset                  Reset thresholds to defaults
 - `special` manages the same OUI-prefix list as the compiled-in `specialMacs[]`
   (default: Axon camera / Flock Safety OUIs) — anything matching triggers an
   immediate "KNOWN" alert. Prefixes only, e.g. `00:25:DF`, not a full MAC.
-- `allow` manages the same runtime allowlist the Button-A-hold gesture writes
-  to (`/allowlist.txt`), but with a remove path and the ability to add a MAC
-  you already know without waiting for it to appear on screen. Requires the
+- `allow` manages the same runtime allowlist the **Allowlist Top Device** menu
+  action writes to (`/allowlist.txt`), but with a remove path and the ability to
+  add a MAC you already know without waiting for it to appear on screen. Requires the
   full 17-character MAC (`AA:BB:CC:DD:EE:FF`) for an exact match.
 - `threshold set persistence <0.0-1.0>` raises or lowers the alert bar
   directly (default `0.75`, see [Detection Algorithm](#detection-algorithm)).
@@ -294,8 +299,8 @@ const char *defaultSpecialMacs[] = {
 ### Allowlist (Trusted Devices)
 
 For most cases, use the `allow add <MAC>` serial command or the in-field
-Button-A-hold gesture instead — both allowlist by exact MAC and need no
-reflash. `allowlistMacs[]` in PathShield.ino is a separate, OUI-*prefix*
+**Allowlist Top Device** menu action instead — both allowlist by exact MAC and
+need no reflash. `allowlistMacs[]` in PathShield.ino is a separate, OUI-*prefix*
 compiled-in allowlist for when you want to ignore every device from a given
 manufacturer, not just one:
 
@@ -375,8 +380,10 @@ threshold set persistence 0.40
 - Hides random MAC addresses and noise
 
 **Fastest fix: Allowlist it in the field**
-1. Press **Button A** to pause, scroll until the device is at the top
-2. Hold **Button A** for 1 second — it's gone and won't be tracked again
+1. Hold **Button A** to stop scanning, then tap **Button A** to scroll until the
+   device is at the top of the list
+2. Hold **Button B** for the settings menu, pick **Allowlist Top Device** — the
+   row shows the tail of the MAC it will act on, so you can check it first
 3. No reflash needed; persists across reboots
 
 **Also works from a shell, no button gesture needed**
@@ -397,9 +404,10 @@ threshold set rssi_stability 6       // Require tighter RSSI stability
 ```
 (`MIN_DETECTIONS` stays compile-time-only — see [Adjust Sensitivity](#adjust-sensitivity).)
 
-### Cannot Resume from Pause
+### Cannot Start Scanning Again After Stopping
 
-Hold Button B for 1 full second (not just tap).
+Hold **Button A** for a full second (not just a tap) — the same button stops and
+starts scanning. A tap scrolls the list instead.
 
 ### Device Crashes / Resets
 
@@ -409,11 +417,18 @@ Watch the memory bar on screen — red means critically low. If a BLE or WiFi sc
 
 Normal on first flash. The device formats SPIFFS automatically (~30 seconds), then boots normally.
 
+### Cannot Open the Settings Menu
+
+Hold **Button B** for a full second. There is no two-button chord — earlier
+builds used A+B, which was close to impossible to land because whichever button
+went down first fired its own action. If in doubt, the on-device cheat sheet
+(shown at boot, or **Settings -> Show Controls**) lists every gesture.
+
 ### Button Not Responding
 
 - Screen may be dimmed (press any button to wake)
 - Wait 200ms between presses (debounce)
-- For menu: hold both buttons 300ms+
+- A hold takes a full second; releasing early runs the tap action instead
 
 
 ## Hardware
