@@ -59,20 +59,39 @@ const int MEMORY_GOOD = 150;
 
 unsigned long lastBtnAPress = 0;
 unsigned long lastBtnBPress = 0;
-unsigned long lastComboCheck = 0;
 const unsigned long DEBOUNCE_DELAY = 200;
 bool inMenu = false;
 int menuIndex = 0;
 int menuBaseY = 0;
-#define MENU_OPTION_COUNT 6
+#define MENU_OPTION_COUNT 9
+#define MENU_ROW_H 10
+
+// How long a button must stay down to count as a hold rather than a tap.
+// Every hold gesture uses this one value so "hold" means the same thing
+// everywhere — see waitForHold().
+#define BUTTON_HOLD_MS 600
 
 bool highBrightness = true;
 bool currentlyBright = true;
 bool paused = false;
 enum FilterMode { FILTER_ALL, FILTER_NAMED, FILTER_ALERTS };
 FilterMode filterMode = FILTER_ALL;
-bool discreetAlerts = false;
+
+// Visual intensity of a tracker alert. SIMPLE is the default: the old
+// red/blue strobe (now LOUD) is deliberately opt-in, since a flashing screen
+// is a lot to inflict on someone every time a tracker turns up.
+enum AlertStyle : uint8_t { ALERT_LOUD = 0, ALERT_SIMPLE = 1, ALERT_QUIET = 2 };
+AlertStyle alertStyle = ALERT_SIMPLE;
 bool alertSoundEnabled = true;
+
+const char *alertStyleName(AlertStyle style) {
+  switch (style) {
+    case ALERT_LOUD:  return "LOUD";
+    case ALERT_QUIET: return "QUIET";
+    default:          return "SIMPLE";
+  }
+}
+
 bool screenDimmed = false;
 unsigned long lastButtonPressTime = 0;
 unsigned long lastActivityTime = 0;
@@ -214,6 +233,11 @@ struct DeviceInfo {
 
 DeviceInfo *trackedDevices = NULL;
 int deviceIndex = 0;
+// Number of rows the last render actually put on screen (post-filter), and
+// which of the two lists it drew. Scrolling and the WiFi/BLE label both key
+// off what's *displayed*, not off whichever band scanTask happens to be on.
+int lastVisibleItemCount = 0;
+bool displayingWifiView = true;
 void updateTimeWindows(DeviceInfo &device, unsigned long currentTime);
 float calculatePersistenceScore(DeviceInfo &device, unsigned long currentTime);
 NimBLEScan *pBLEScan;
@@ -755,10 +779,10 @@ void alertUser(bool isSpecial, const char *name, const char *mac,
 
   screenOn = true;
   lastActivityTime = millis();
-  // Loud mode always jumps to max brightness to grab attention. Discreet mode
-  // respects whatever brightness the user already chose — the point is to
-  // not draw attention, so don't force the screen bright either.
-  M5.Display.setBrightness(discreetAlerts ? (highBrightness ? 204 : 77) : 204);
+  // Loud/Simple jump to max brightness to grab attention. Quiet respects
+  // whatever brightness the user already chose — the point is to not draw
+  // attention, so don't force the screen bright either.
+  M5.Display.setBrightness(alertStyle == ALERT_QUIET ? (highBrightness ? 204 : 77) : 204);
 
   if (alertSoundEnabled) {
     M5.Speaker.tone(1800, 120);
@@ -767,13 +791,13 @@ void alertUser(bool isSpecial, const char *name, const char *mac,
     delay(160);
   }
 
-  if (discreetAlerts) {
-    // Quiet variant: no strobe, just a black screen with a thin colored
-    // border — enough to notice without drawing attention to the device.
+  if (alertStyle == ALERT_QUIET) {
+    // No strobe, no fill: a black screen with a thin colored border — enough
+    // to notice without drawing attention to the device.
     M5.Display.fillScreen(BLACK);
     M5.Display.drawRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, isSpecial ? ORANGE : RED);
     M5.Display.drawRect(1, 1, SCREEN_WIDTH - 2, SCREEN_HEIGHT - 2, isSpecial ? ORANGE : RED);
-  } else if (isSpecial) {
+  } else if (alertStyle == ALERT_LOUD && isSpecial) {
     for (int i = 0; i < 5; i++) {
       M5.Display.fillScreen(RED);
       delay(200);
@@ -781,13 +805,20 @@ void alertUser(bool isSpecial, const char *name, const char *mac,
       delay(200);
     }
   } else {
+    // Simple: one solid red screen, no animation. Privacy-invader hits still
+    // read differently at a glance via an orange border rather than a strobe.
     M5.Display.fillScreen(RED);
+    if (isSpecial) {
+      for (int i = 0; i < 3; i++) {
+        M5.Display.drawRect(i, i, SCREEN_WIDTH - i * 2, SCREEN_HEIGHT - i * 2, ORANGE);
+      }
+    }
   }
 
   M5.Display.setCursor(0, 10);
-  M5.Display.setTextColor(discreetAlerts ? (isSpecial ? ORANGE : RED) : WHITE);
+  M5.Display.setTextColor(alertStyle == ALERT_QUIET ? (isSpecial ? ORANGE : RED) : WHITE);
   M5.Display.setTextSize(2);
-  M5.Display.print(discreetAlerts ? "Tracker Alert" : "Tracker Detected!");
+  M5.Display.print(alertStyle == ALERT_QUIET ? "Tracker Alert" : "Tracker Detected!");
   M5.Display.setTextSize(1);
 
   M5.Display.setCursor(0, 40);
@@ -854,6 +885,98 @@ void showFeedback(const char* msg, uint16_t color, const char* sub = NULL) {
   M5.Display.drawFastHLine(0, 96, SCREEN_WIDTH, MAGENTA);
 }
 
+// The full control scheme on one screen. Shown once at boot and available any
+// time from the settings menu — six gestures across two modes is more than a
+// 240x135 footer hint can carry, and "which button opens the menu" shouldn't
+// be something anyone has to guess at.
+void drawControlsScreen() {
+  M5.Display.fillScreen(BLACK);
+
+  M5.Display.setTextSize(1);
+  M5.Display.setTextColor(CYAN);
+  M5.Display.setCursor(2, 2);
+  M5.Display.print("CONTROLS");
+  M5.Display.setTextColor(DARKGREY);
+  M5.Display.setCursor(150, 2);
+  M5.Display.print("HOLD = 1 sec");
+
+  M5.Display.drawFastHLine(0, 12, SCREEN_WIDTH, CYAN);
+
+  M5.Display.setTextColor(YELLOW);
+  M5.Display.setCursor(2, 17);
+  M5.Display.print("SCANNING / LIST");
+
+  M5.Display.setTextColor(WHITE);
+  M5.Display.setCursor(2, 28);
+  M5.Display.print(" A       Scroll list");
+  M5.Display.setCursor(2, 38);
+  M5.Display.print(" B       Filter: All/Named/Alerts");
+  M5.Display.setTextColor(GREEN);
+  M5.Display.setCursor(2, 48);
+  M5.Display.print(" HOLD A  Stop / start scanning");
+  M5.Display.setCursor(2, 58);
+  M5.Display.print(" HOLD B  Open settings menu");
+
+  M5.Display.setTextColor(YELLOW);
+  M5.Display.setCursor(2, 72);
+  M5.Display.print("SETTINGS MENU");
+
+  M5.Display.setTextColor(WHITE);
+  M5.Display.setCursor(2, 83);
+  M5.Display.print(" A       Next option");
+  M5.Display.setCursor(2, 93);
+  M5.Display.print(" B       Select");
+  M5.Display.setTextColor(GREEN);
+  M5.Display.setCursor(2, 103);
+  M5.Display.print(" HOLD B  Close menu");
+
+  M5.Display.drawFastHLine(0, 115, SCREEN_WIDTH, MAGENTA);
+  M5.Display.setTextColor(DARKGREY);
+  M5.Display.setCursor(2, 120);
+  M5.Display.print("Alert: any button dismisses");
+  M5.Display.setTextColor(YELLOW);
+  M5.Display.setCursor(168, 120);
+  M5.Display.print("A/B: OK");
+}
+
+// Draws the sheet and blocks until a button press, or until timeoutMs elapses
+// (pass 0 to wait indefinitely). Core 1 only — it touches buttons and display.
+void showControlsScreen(unsigned long timeoutMs) {
+  drawControlsScreen();
+
+  unsigned long start = millis();
+  while (timeoutMs == 0 || millis() - start < timeoutMs) {
+    M5.update();
+    if (M5.BtnA.wasPressed() || M5.BtnB.wasPressed()) break;
+    delay(20);
+  }
+
+  // Leave the button released before returning, so the press that dismissed
+  // this screen doesn't also get read as a gesture by whatever comes next.
+  // Bounded, so a button wedged against something can't strand boot here.
+  unsigned long releaseWait = millis();
+  while ((M5.BtnA.isPressed() || M5.BtnB.isPressed()) &&
+         millis() - releaseWait < 3000) {
+    M5.update();
+    delay(10);
+  }
+  M5.update();
+}
+
+void printControlsToSerial() {
+  Serial.println("--- PathShield controls (HOLD = press for 1 second) ---");
+  Serial.println("  Scanning / list:");
+  Serial.println("    A         Scroll the list");
+  Serial.println("    B         Cycle filter: All -> Named -> Alerts");
+  Serial.println("    HOLD A    Stop / start scanning");
+  Serial.println("    HOLD B    Open the settings menu");
+  Serial.println("  Settings menu:");
+  Serial.println("    A         Next option");
+  Serial.println("    B         Select");
+  Serial.println("    HOLD B    Close the menu");
+  Serial.println("  Alert screen: either button dismisses.");
+}
+
 void displayStartupMessage() {
   M5.Display.fillScreen(BLACK);
 
@@ -885,7 +1008,7 @@ void displayStartupMessage() {
 
   M5.Display.setTextColor(DARKGREY);
   M5.Display.setCursor(85, 72);
-  M5.Display.print("v2.2.0");
+  M5.Display.print("v2.4.0");
 
   M5.Display.drawFastHLine(0, 85, SCREEN_WIDTH, MAGENTA);
 
@@ -927,6 +1050,31 @@ void displayStartupMessage() {
   delay(50);
 }
 
+// Which list the findings screen should render. The scanner keeps alternating
+// bands regardless — this only decides what's on screen. With a BLE-side
+// filter active the view pins to the BLE list rather than flipping to the
+// unfiltered WiFi list every few seconds, which read as the filter switching
+// itself off and back on.
+bool isWifiView() {
+  return scanningWiFi && filterMode == FILTER_ALL;
+}
+
+const char *filterLabel(FilterMode mode) {
+  switch (mode) {
+    case FILTER_NAMED:  return "NAMED";
+    case FILTER_ALERTS: return "ALERTS";
+    default:            return "ALL";
+  }
+}
+
+uint16_t filterColor(FilterMode mode) {
+  switch (mode) {
+    case FILTER_NAMED:  return CYAN;
+    case FILTER_ALERTS: return RED;
+    default:            return ORANGE;
+  }
+}
+
 void drawTopBar() {
   M5.Display.drawFastHLine(0, 0, SCREEN_WIDTH, CYAN);
   M5.Display.drawFastHLine(0, 1, SCREEN_WIDTH, CYAN);
@@ -934,7 +1082,7 @@ void drawTopBar() {
   M5.Display.setTextSize(1);
   M5.Display.setCursor(4, 3);
   M5.Display.setTextColor(paused ? RED : GREEN);
-  M5.Display.print(paused ? "PAUSE" : (scanningWiFi ? "WiFi" : "BLE"));
+  M5.Display.print(paused ? "PAUSE" : (displayingWifiView ? "WiFi" : "BLE"));
 
   static float lastValidBatVoltage = 3.7f;
   float batVoltage = M5.Power.getBatteryVoltage() / 1000.0f;
@@ -1021,11 +1169,11 @@ uint32_t getDisplayStateHash() {
   hash = hash * 31 + deviceIndex;
   hash = hash * 31 + wifiDeviceIndex;
   hash = hash * 31 + scrollIndex;
-  hash = hash * 31 + (scanningWiFi ? 1 : 0);
+  hash = hash * 31 + (isWifiView() ? 1 : 0);
   hash = hash * 31 + (paused ? 1 : 0);
   hash = hash * 31 + (uint32_t)filterMode;
 
-  if (scanningWiFi) {
+  if (isWifiView()) {
     for (int i = 0; i < wifiDeviceIndex; i++) {
       hash = hash * 31 + (uint32_t)wifiDevices[i].rssi;
       hash = hash * 31 + wifiDevices[i].detectionCount;
@@ -1053,6 +1201,24 @@ uint32_t getDisplayStateHash() {
   return hash;
 }
 
+// Bottom strip of the findings screen: which filter is live, plus the two
+// gestures that aren't discoverable by mashing buttons. Tap actions are on the
+// controls screen (boot + settings menu) — there isn't room for all six here.
+void drawListFooterHint() {
+  M5.Display.drawFastHLine(0, 133, SCREEN_WIDTH, CYAN);
+  M5.Display.drawFastHLine(0, 134, SCREEN_WIDTH, CYAN);
+
+  M5.Display.setTextSize(1);
+  M5.Display.setTextColor(filterColor(filterMode));
+  M5.Display.setCursor(2, 124);
+  const char *tag = filterLabel(filterMode);
+  M5.Display.print(tag);
+
+  M5.Display.setTextColor(GREEN);
+  M5.Display.setCursor(2 + strlen(tag) * 6 + 8, 124);
+  M5.Display.print(paused ? "HOLD A:Scan B:Menu" : "HOLD A:Stop B:Menu");
+}
+
 void displayTrackedDevices() {
   unsigned long now = millis();
 
@@ -1074,15 +1240,19 @@ void displayTrackedDevices() {
   lastStateHash = currentHash;
   lastDisplayRender = now;
 
+  displayingWifiView = isWifiView();
+
   M5.Display.fillScreen(BLACK);
   drawTopBar();
 
   // Show scanning message when no devices found yet
   if (deviceIndex == 0 && wifiDeviceIndex == 0) {
+    lastVisibleItemCount = 0;
     M5.Display.setTextSize(2);
     M5.Display.setTextColor(DARKGREY);
     M5.Display.setCursor(55, 60);
-    M5.Display.print("Scanning...");
+    M5.Display.print(paused ? "Stopped" : "Scanning...");
+    drawListFooterHint();
     xSemaphoreGive(deviceMutex);
     return;
   }
@@ -1092,12 +1262,16 @@ void displayTrackedDevices() {
   const int maxDisplay = 3;
   int totalItems = 0;
 
-  if (scanningWiFi) {
-    // Allowlisting only applies to BLE devices — never act on a stale BLE
-    // address while a WiFi list is on screen.
-    topVisibleValid = false;
+  if (displayingWifiView) {
+    // topVisibleAddress deliberately survives a WiFi frame: with no filter set
+    // the view alternates bands every few seconds, and clearing it here would
+    // make the menu's allowlist action available only half the time. The menu
+    // shows the MAC tail it would act on, so it's never a blind press.
 
     totalItems = wifiDeviceIndex;
+    // APs ageing out can strand scrollIndex past the end of the shorter list.
+    if (scrollIndex >= wifiDeviceIndex) scrollIndex = 0;
+
     for (int i = scrollIndex; i < wifiDeviceIndex && displayed < maxDisplay;
          i++, displayed++) {
       if (displayed > 0) {
@@ -1191,7 +1365,30 @@ void displayTrackedDevices() {
 
     totalItems = filteredCount;
 
-    if (filteredCount > 0 && scrollIndex < filteredCount) {
+    // A filter that matches nothing yet should say so, not leave a blank
+    // screen that looks like the device stopped working.
+    if (filteredCount == 0) {
+      lastVisibleItemCount = 0;
+      topVisibleValid = false;
+      M5.Display.setTextSize(2);
+      M5.Display.setTextColor(filterColor(filterMode));
+      M5.Display.setCursor(2, 45);
+      M5.Display.print(filterMode == FILTER_ALERTS ? "No alerts" : "No named");
+      M5.Display.setTextSize(1);
+      M5.Display.setTextColor(DARKGREY);
+      M5.Display.setCursor(2, 70);
+      M5.Display.print(deviceIndex);
+      M5.Display.print(" BLE device(s) tracked, none match");
+      drawListFooterHint();
+      xSemaphoreGive(deviceMutex);
+      return;
+    }
+
+    // Devices ageing out from under a filter can strand scrollIndex past the
+    // end of the (now shorter) list.
+    if (scrollIndex >= filteredCount) scrollIndex = 0;
+
+    if (scrollIndex < filteredCount) {
       strncpy(topVisibleAddress, trackedDevices[sortedIndices[scrollIndex]].address, 17);
       topVisibleAddress[17] = '\0';
       topVisibleValid = true;
@@ -1284,8 +1481,9 @@ void displayTrackedDevices() {
     }
   }
 
-  M5.Display.drawFastHLine(0, 133, SCREEN_WIDTH, CYAN);
-  M5.Display.drawFastHLine(0, 134, SCREEN_WIDTH, CYAN);
+  lastVisibleItemCount = totalItems;
+
+  drawListFooterHint();
 
   if (totalItems > 0) {
     M5.Display.setTextSize(1);
@@ -1300,12 +1498,6 @@ void displayTrackedDevices() {
     int xPos = SCREEN_WIDTH - textWidth - 4;
     M5.Display.setCursor(xPos, 124);
     M5.Display.print(countStr);
-
-    if (paused && totalItems > maxDisplay) {
-      M5.Display.setCursor(80, 124);
-      M5.Display.setTextColor(GREEN);
-      M5.Display.print("A/B:Scroll");
-    }
   }
 
   xSemaphoreGive(deviceMutex);
@@ -1327,7 +1519,7 @@ void displayMenuScreen() {
 
   M5.Display.drawLine(0, 12, SCREEN_WIDTH, 12, DARKGREY);
 
-  int y = 16;
+  int y = 15;
 
   M5.Display.setTextColor(WHITE);
   M5.Display.setCursor(2, y);
@@ -1346,78 +1538,83 @@ void displayMenuScreen() {
   if (batPercent > 100) batPercent = 100;
   if (batPercent < 0) batPercent = 0;
   float estHoursRemaining = (batPercent / 100.0f) * TYPICAL_BATTERY_LIFE_HOURS;
+  // Everything status-y on one line — nine menu rows need the vertical space.
   M5.Display.print("Bat:");
   M5.Display.print(batPercent);
-  M5.Display.print("% (~");
+  M5.Display.print("% ~");
   if (estHoursRemaining >= 1.0f) {
     M5.Display.print(estHoursRemaining, 1);
-    M5.Display.print("h)");
+    M5.Display.print("h");
   } else {
     M5.Display.print((int)(estHoursRemaining * 60));
-    M5.Display.print("m)");
+    M5.Display.print("m");
   }
-  M5.Display.print(" Br:");
-  M5.Display.print(highBrightness ? "Hi" : "Lo");
-  y += 12;
-
-  // Compact: Timeout/RAM/Tracked share one line so 6 menu rows still fit
-  // this screen's 135px height.
-  M5.Display.setCursor(2, y);
-  M5.Display.print("T:");
-  M5.Display.print(screenTimeoutMs / 1000);
-  M5.Display.print("s RAM:");
+  M5.Display.print(" RAM:");
   M5.Display.print(ESP.getFreeHeap() / 1024);
   M5.Display.print("K Trk:");
   M5.Display.print(deviceIndex);
-  y += 16;
+  y += 11;
 
   M5.Display.drawLine(0, y, SCREEN_WIDTH, y, DARKGREY);
-  y += 4;
+  y += 3;
 
   menuBaseY = y;
 
-  M5.Display.setTextColor(CYAN);
+  char timeoutStr[12];
+  snprintf(timeoutStr, sizeof(timeoutStr), "%lus", screenTimeoutMs / 1000);
 
-  M5.Display.setCursor(10, y);
-  M5.Display.print("Toggle Brightness");
-  y += 11;
+  // Show the MAC tail the allowlist action would actually consume, so it's a
+  // confirmable choice rather than a blind press.
+  char allowTarget[9] = "--";
+  if (topVisibleValid && strlen(topVisibleAddress) >= 8) {
+    strncpy(allowTarget, topVisibleAddress + strlen(topVisibleAddress) - 8, 8);
+    allowTarget[8] = '\0';
+  }
 
-  M5.Display.setCursor(10, y);
-  M5.Display.print("Set Screen Timeout");
-  y += 11;
+  // Label + current value per row, so the menu reads as state rather than as
+  // a list of verbs whose effect you only learn by pressing them.
+  const char *labels[MENU_OPTION_COUNT] = {
+    "Alert Style",  "Alert Sound",     "Brightness",    "Screen Timeout",
+    "Allowlist Top Device", "Export Incident", "Clear Devices",
+    "Show Controls", "Shutdown"
+  };
+  const char *values[MENU_OPTION_COUNT] = {
+    alertStyleName(alertStyle),
+    alertSoundEnabled ? "ON" : "OFF",
+    highBrightness ? "HIGH" : "LOW",
+    timeoutStr,
+    allowTarget,
+    "", "", "", ""
+  };
 
-  M5.Display.setCursor(10, y);
-  M5.Display.print("Alert Mode");
-  y += 11;
-
-  M5.Display.setCursor(10, y);
-  M5.Display.print("Export Incident");
-  y += 11;
-
-  M5.Display.setCursor(10, y);
-  M5.Display.print("Clear Devices");
-  y += 11;
-
-  M5.Display.setCursor(10, y);
-  M5.Display.print("Shutdown");
-  y += 12;
+  for (int i = 0; i < MENU_OPTION_COUNT; i++) {
+    M5.Display.setTextColor(CYAN);
+    M5.Display.setCursor(10, y);
+    M5.Display.print(labels[i]);
+    if (strlen(values[i]) > 0) {
+      M5.Display.setTextColor(WHITE);
+      M5.Display.setCursor(SCREEN_WIDTH - 4 - (int)(strlen(values[i]) * 6), y);
+      M5.Display.print(values[i]);
+    }
+    y += MENU_ROW_H;
+  }
 
   M5.Display.drawLine(0, y, SCREEN_WIDTH, y, DARKGREY);
 
   M5.Display.setTextColor(YELLOW);
   M5.Display.setTextSize(1);
   M5.Display.setCursor(2, y + 3);
-  M5.Display.print("A:Nav B:Sel A+B:Exit");
+  M5.Display.print("A:Next  B:Select  HOLD B:Close");
 }
 
 void highlightMenuOption(int index) {
   for (int i = 0; i < MENU_OPTION_COUNT; i++) {
-    M5.Display.setCursor(2, menuBaseY + (i * 11));
+    M5.Display.setCursor(2, menuBaseY + (i * MENU_ROW_H));
     M5.Display.setTextColor(BLACK);
     M5.Display.print(">");
   }
 
-  M5.Display.setCursor(2, menuBaseY + (index * 11));
+  M5.Display.setCursor(2, menuBaseY + (index * MENU_ROW_H));
   M5.Display.setTextColor(YELLOW);
   M5.Display.print(">");
 }
@@ -1432,8 +1629,8 @@ void saveUserPreferences() {
   file.println(highBrightness ? "1" : "0");
   file.print("timeout=");
   file.println(screenTimeoutMs);
-  file.print("discreet=");
-  file.println(discreetAlerts ? "1" : "0");
+  file.print("alertstyle=");
+  file.println((int)alertStyle);
   file.print("sound=");
   file.println(alertSoundEnabled ? "1" : "0");
   file.print("persistThresh=");
@@ -1452,6 +1649,8 @@ void loadUserPreferences() {
     return; // File doesn't exist, use defaults
   }
 
+  bool sawAlertStyle = false;
+
   while (file.available()) {
     String line = file.readStringUntil('\n');
     line.trim();
@@ -1460,8 +1659,16 @@ void loadUserPreferences() {
       highBrightness = line.substring(11).toInt() == 1;
     } else if (line.startsWith("timeout=")) {
       screenTimeoutMs = line.substring(8).toInt();
+    } else if (line.startsWith("alertstyle=")) {
+      int v = line.substring(11).toInt();
+      if (v >= ALERT_LOUD && v <= ALERT_QUIET) alertStyle = (AlertStyle)v;
+      sawAlertStyle = true;
     } else if (line.startsWith("discreet=")) {
-      discreetAlerts = line.substring(9).toInt() == 1;
+      // Pre-alertstyle prefs file: the old boolean only distinguished quiet
+      // from the strobe, so map it onto the closest of the three styles.
+      if (!sawAlertStyle) {
+        alertStyle = line.substring(9).toInt() == 1 ? ALERT_QUIET : ALERT_LOUD;
+      }
     } else if (line.startsWith("sound=")) {
       alertSoundEnabled = line.substring(6).toInt() == 1;
     } else if (line.startsWith("persistThresh=")) {
@@ -1707,6 +1914,7 @@ void clearDevices() {
 
   deviceIndex = 0;
   scrollIndex = 0;
+  topVisibleValid = false;
 
   xSemaphoreGive(deviceMutex);
 }
@@ -1740,6 +1948,7 @@ void dumpIncidentsToSerial() {
 void printSerialHelp() {
   Serial.println("--- PathShield serial commands ---");
   Serial.println("  help                             Show this list");
+  Serial.println("  controls                         Show the on-device button controls");
   Serial.println("  dump                             Print /incidents.txt");
   Serial.println("  config                           Show full current configuration");
   Serial.println("  special list                     List privacy-invader MAC prefixes");
@@ -1905,6 +2114,9 @@ void handleThresholdCommand(const char *sub, const char *name, const char *value
 
 void printSerialConfig() {
   Serial.println("=== PathShield configuration ===");
+  Serial.printf("  alert style     = %s  (LOUD strobes, SIMPLE fills, QUIET borders)\n",
+                alertStyleName(alertStyle));
+  Serial.printf("  alert sound     = %s\n", alertSoundEnabled ? "ON" : "OFF");
   handleSpecialCommand("list", NULL);
   handleAllowCommand("list", NULL);
   handleThresholdCommand("list", NULL, NULL);
@@ -1918,6 +2130,8 @@ void handleSerialCommand(char *line) {
 
   if (strcasecmp(cmd, "help") == 0 || strcmp(cmd, "?") == 0) {
     printSerialHelp();
+  } else if (strcasecmp(cmd, "controls") == 0) {
+    printControlsToSerial();
   } else if (strcasecmp(cmd, "dump") == 0 || strcasecmp(cmd, "d") == 0) {
     dumpIncidentsToSerial();
   } else if (strcasecmp(cmd, "config") == 0) {
@@ -1956,17 +2170,23 @@ void shutdownDevice() {
 void executeMenuOption(int index) {
   switch (index) {
     case 0:
+      cycleAlertStyle();
+      break;
+    case 1:
+      toggleAlertSound();
+      break;
+    case 2:
       toggleBrightness();
       showFeedback(highBrightness ? "BRIGHT" : "DIM", CYAN);
       delay(1000);
       break;
-    case 1:
+    case 3:
       cycleScreenTimeout();
       break;
-    case 2:
-      cycleAlertMode();
+    case 4:
+      allowlistTopDevice();
       break;
-    case 3: {
+    case 5: {
       int exported = exportIncident();
       char msg[16];
       snprintf(msg, sizeof(msg), "%d EXPORTED", exported);
@@ -1974,16 +2194,19 @@ void executeMenuOption(int index) {
       delay(1000);
       break;
     }
-    case 4:
+    case 6:
       clearDevices();
       showFeedback("CLEARED", GREEN);
       delay(1000);
       break;
-    case 5:
+    case 7:
+      showControlsScreen(0);
+      break;
+    case 8:
       shutdownDevice();
       return;
   }
-  
+
   forceDisplayRefresh();
   displayMenuScreen();
   highlightMenuOption(menuIndex);
@@ -2011,134 +2234,51 @@ void cycleScreenTimeout() {
   delay(1000);
 }
 
-// 4-state cycle: Loud+Sound -> Loud+Mute -> Quiet+Sound -> Quiet+Mute -> repeat.
-// Combined into one setting (rather than two independent toggles) to save a
-// menu row on a screen that's already tight on vertical space.
-void cycleAlertMode() {
-  if (!discreetAlerts && alertSoundEnabled) {
-    alertSoundEnabled = false;
-  } else if (!discreetAlerts && !alertSoundEnabled) {
-    discreetAlerts = true;
-    alertSoundEnabled = true;
-  } else if (discreetAlerts && alertSoundEnabled) {
-    alertSoundEnabled = false;
-  } else {
-    discreetAlerts = false;
-    alertSoundEnabled = true;
-  }
+// 3-state cycle: Simple -> Quiet -> Loud -> repeat. Sound is its own menu row
+// now; folding it in here made a 4-state cycle nobody could predict.
+void cycleAlertStyle() {
+  alertStyle = (AlertStyle)((alertStyle + 1) % 3);
   saveUserPreferences();
 
-  const char *label = discreetAlerts
-                           ? (alertSoundEnabled ? "QUIET+SOUND" : "QUIET+MUTE")
-                           : (alertSoundEnabled ? "LOUD+SOUND" : "LOUD+MUTE");
-  showFeedback(label, discreetAlerts ? CYAN : ORANGE);
+  uint16_t color = alertStyle == ALERT_QUIET ? CYAN
+                  : alertStyle == ALERT_LOUD ? RED
+                  : ORANGE;
+  showFeedback(alertStyleName(alertStyle), color,
+               alertStyle == ALERT_QUIET  ? "Border only, no fill"
+               : alertStyle == ALERT_LOUD ? "Red/blue strobe"
+                                          : "Solid screen, no flashing");
+  delay(1200);
+}
+
+void toggleAlertSound() {
+  alertSoundEnabled = !alertSoundEnabled;
+  saveUserPreferences();
+  showFeedback(alertSoundEnabled ? "SOUND ON" : "SOUND OFF",
+               alertSoundEnabled ? GREEN : DARKGREY);
   delay(1000);
 }
 
-bool checkButtonCombo() {
-  unsigned long currentMillis = millis();
-
-  if (M5.BtnA.isPressed() && M5.BtnB.isPressed()) {
-    if (currentMillis - lastComboCheck > 300) {
-      lastComboCheck = currentMillis;
-      return true;
-    }
+void allowlistTopDevice() {
+  // Acts on the topmost row of the last-rendered BLE list — kills a false
+  // positive on the spot, no reflash needed. BLE-only (see topVisibleValid).
+  if (!topVisibleValid) {
+    showFeedback("NOTHING", DARKGREY, "No BLE device on the list");
+    delay(1200);
+    return;
   }
-  return false;
-}
 
-void handleBtnA() {
-  lastButtonPressTime = millis();
-  lastActivityTime = millis();
-
-  if (paused) {
-    unsigned long pressStart = millis();
-
-    while (M5.BtnA.isPressed() && (millis() - pressStart < 1000)) {
-      M5.update();
-      delay(10);
-    }
-
-    if (millis() - pressStart >= 1000) {
-      // Long-press: allowlist the topmost visible device — kills a false
-      // positive on the spot, no reflash needed. BLE-only (see topVisibleValid).
-      if (topVisibleValid) {
-        char allowedAddr[18];
-        strncpy(allowedAddr, topVisibleAddress, 17);
-        allowedAddr[17] = '\0';
-        if (allowlistDevice(allowedAddr)) {
-          showFeedback("ALLOWLISTED", GREEN, allowedAddr);
-        } else {
-          showFeedback("ALLOW FULL", RED);
-        }
-      } else {
-        showFeedback("NOTHING", DARKGREY);
-      }
-      delay(1200);
-      lastStateHash = 0;
-      lastDisplayRender = 0;
-      displayTrackedDevices();
-    } else if (scrollIndex > 0) {
-      scrollIndex--;
-      lastStateHash = 0;
-      lastDisplayRender = 0;
-      displayTrackedDevices();
-    }
+  char allowedAddr[18];
+  strncpy(allowedAddr, topVisibleAddress, 17);
+  allowedAddr[17] = '\0';
+  if (allowlistDevice(allowedAddr)) {
+    // The device is gone from the tracked list now; the next render re-points
+    // this at whatever moved up into its place.
+    topVisibleValid = false;
+    showFeedback("ALLOWED", GREEN, allowedAddr);
   } else {
-    paused = true;
-    scrollIndex = 0;
-    showFeedback("PAUSED", RED, "Hold B to Resume");
-    delay(1500);
-    lastStateHash = 0;
-    lastDisplayRender = 0;
-    displayTrackedDevices();
+    showFeedback("LIST FULL", RED);
   }
-}
-
-void handleBtnB() {
-  lastButtonPressTime = millis();
-  lastActivityTime = millis();
-
-  if (paused) {
-    unsigned long pressStart = millis();
-
-    while (M5.BtnB.isPressed() && (millis() - pressStart < 1000)) {
-      M5.update();
-      delay(10);
-    }
-
-    if (millis() - pressStart >= 1000) {
-      paused = false;
-      scrollIndex = 0;
-      showFeedback("RESUMED", GREEN);
-      delay(800);
-      lastStateHash = 0;
-      lastDisplayRender = 0;
-      displayTrackedDevices();
-    } else {
-      int maxScroll = scanningWiFi ? wifiDeviceIndex - 3 : deviceIndex - 3;
-      if (maxScroll < 0) maxScroll = 0;
-      if (scrollIndex < maxScroll) {
-        scrollIndex++;
-        lastStateHash = 0;
-        lastDisplayRender = 0;
-        displayTrackedDevices();
-      }
-    }
-  } else {
-    filterMode = (FilterMode)((filterMode + 1) % 3);
-    const char *label = filterMode == FILTER_NAMED ? "NAMED ONLY"
-                       : filterMode == FILTER_ALERTS ? "ALERTS ONLY"
-                       : "SHOW ALL";
-    uint16_t color = filterMode == FILTER_NAMED ? CYAN
-                    : filterMode == FILTER_ALERTS ? RED
-                    : ORANGE;
-    showFeedback(label, color);
-    delay(800);
-    lastStateHash = 0;
-    lastDisplayRender = 0;
-    displayTrackedDevices();
-  }
+  delay(1200);
 }
 
 void forceDisplayRefresh() {
@@ -2147,9 +2287,93 @@ void forceDisplayRefresh() {
   lastMenuRender = 0;
 }
 
-void handleButtonCombination() {
-  inMenu = !inMenu;
+void refreshList() {
+  forceDisplayRefresh();
+  displayTrackedDevices();
+}
+
+// Blocks while the button stays down, up to BUTTON_HOLD_MS, and reports
+// whether it was still down at the end. A tap returns immediately on release,
+// so short-press actions stay snappy — only an actual hold costs the wait.
+// Core 1 only: it drives M5.update().
+bool waitForHold(m5::Button_Class &btn) {
+  unsigned long pressStart = millis();
+  while (btn.isPressed() && (millis() - pressStart < BUTTON_HOLD_MS)) {
+    M5.update();
+    delay(10);
+  }
+  return (millis() - pressStart >= BUTTON_HOLD_MS);
+}
+
+void setPaused(bool wantPaused) {
+  paused = wantPaused;
+  scrollIndex = 0;
+  showFeedback(paused ? "STOPPED" : "SCANNING", paused ? RED : GREEN,
+               paused ? "Hold A to scan again" : NULL);
+  delay(900);
+  refreshList();
+}
+
+void openMenu() {
+  inMenu = true;
+  menuIndex = 0;
   lastActivityTime = millis();
+  forceDisplayRefresh();
+  displayMenuScreen();
+  highlightMenuOption(menuIndex);
+}
+
+void closeMenu() {
+  inMenu = false;
+  lastActivityTime = millis();
+  refreshList();
+}
+
+void cycleFilter() {
+  filterMode = (FilterMode)((filterMode + 1) % 3);
+  // Row counts differ per filter; keeping the old offset would drop the user
+  // into the middle of a list they didn't scroll.
+  scrollIndex = 0;
+
+  const char *label = filterMode == FILTER_NAMED ? "NAMED"
+                     : filterMode == FILTER_ALERTS ? "ALERTS"
+                     : "ALL";
+  showFeedback(label, filterColor(filterMode),
+               filterMode == FILTER_ALL ? "WiFi + BLE" : "BLE only");
+  delay(800);
+  refreshList();
+}
+
+// One scroll direction that wraps, rather than separate up/down buttons —
+// Button B is needed for the filter, and three rows per page makes wrapping
+// cheap to navigate.
+void scrollList() {
+  int maxTop = lastVisibleItemCount - 3;
+  if (maxTop < 0) maxTop = 0;
+  scrollIndex = (scrollIndex >= maxTop) ? 0 : scrollIndex + 1;
+  refreshList();
+}
+
+void handleBtnA() {
+  lastButtonPressTime = millis();
+  lastActivityTime = millis();
+
+  if (waitForHold(M5.BtnA)) {
+    setPaused(!paused);
+  } else {
+    scrollList();
+  }
+}
+
+void handleBtnB() {
+  lastButtonPressTime = millis();
+  lastActivityTime = millis();
+
+  if (waitForHold(M5.BtnB)) {
+    openMenu();
+  } else {
+    cycleFilter();
+  }
 }
 
 // SCANNING TASK - Runs on Core 0
@@ -2467,7 +2691,16 @@ void setup() {
   Serial.printf("Special MAC prefixes loaded: %d\n", specialMacsCount);
   Serial.printf("Thresholds — persistence: %.2f, rssi_stability: %d, rssi_variation: %d\n",
                 persistenceThreshold, rssiStabilityThreshold, rssiVariationThreshold);
+  Serial.printf("Alert style: %s, sound %s\n", alertStyleName(alertStyle),
+                alertSoundEnabled ? "on" : "off");
+  printControlsToSerial();
   Serial.println("Type 'help' over serial for the no-reflash config console.");
+
+  // Controls sheet before the first scan — the button scheme is the one thing
+  // a new user can't work out by looking at the findings screen. Dismissable,
+  // and available any time from the settings menu.
+  M5.Display.setBrightness(highBrightness ? 204 : 77);
+  showControlsScreen(6000);
 
   Serial.print("Screen Timeout: ");
   Serial.println(screenTimeoutMs);
@@ -2639,50 +2872,49 @@ void loop() {
     M5.Display.setBrightness(highBrightness ? 204 : 77);
   }
 
-  // MENU COMBO CHECK (both buttons)
-  if (screenOn && checkButtonCombo()) {
-    inMenu = !inMenu;
-    lastActivityTime = currentMillis;
-    lastDisplayRender = 0;
-    lastMenuRender = 0;
-    lastStateHash = 0;
-
-    if (inMenu) {
-      menuIndex = 0;
-      displayMenuScreen();
-      highlightMenuOption(menuIndex);
-    } else {
-      displayTrackedDevices();
-    }
-    lastDisplayUpdate = currentMillis;
-    return;
-  }
-
   // HANDLE INPUT BASED ON MODE
+  //
+  // Gestures are tap vs hold on a single button — no A+B chord. The chord was
+  // the only way into the settings menu and was near-impossible to land, since
+  // whichever button went down first had already fired its own action.
+  // Handlers that hold-detect block for up to BUTTON_HOLD_MS, so re-stamp the
+  // debounce timestamps afterwards against the clock as it is on return.
   if (screenOn) {
     if (inMenu) {
-      // MENU MODE
+      // MENU MODE — A steps through options (no hold-detect, so repeated
+      // presses stay instant), B selects or, held, closes the menu.
       if (btnA && (currentMillis - lastBtnAPress > DEBOUNCE_DELAY)) {
         lastBtnAPress = currentMillis;
         menuIndex = (menuIndex + 1) % MENU_OPTION_COUNT;
         highlightMenuOption(menuIndex);
+        lastActivityTime = currentMillis;
         return;
       }
       if (btnB && (currentMillis - lastBtnBPress > DEBOUNCE_DELAY)) {
-        lastBtnBPress = currentMillis;
-        executeMenuOption(menuIndex);
+        if (waitForHold(M5.BtnB)) {
+          closeMenu();
+        } else {
+          executeMenuOption(menuIndex);
+        }
+        lastBtnBPress = millis();
+        lastActivityTime = millis();
+        lastDisplayUpdate = millis();
         return;
       }
     } else {
       // NORMAL MODE
       if (btnA && (currentMillis - lastBtnAPress > DEBOUNCE_DELAY)) {
-        lastBtnAPress = currentMillis;
         handleBtnA();
+        lastBtnAPress = millis();
+        lastActivityTime = millis();
+        lastDisplayUpdate = millis();
         return;
       }
       if (btnB && (currentMillis - lastBtnBPress > DEBOUNCE_DELAY)) {
-        lastBtnBPress = currentMillis;
         handleBtnB();
+        lastBtnBPress = millis();
+        lastActivityTime = millis();
+        lastDisplayUpdate = millis();
         return;
       }
     }

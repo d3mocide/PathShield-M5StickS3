@@ -79,6 +79,52 @@ checklist.
   cut false positives. Algorithm-level change — needs real-world tuning and
   validation before it should ship, not a quick add.
 
+## Phase 4 — On-hardware UX corrections (from field testing)
+
+Everything above was designed before the S3 port was stable enough to live with.
+Once it was, three things turned out to be wrong in practice rather than on paper.
+
+- [x] **Rebuilt the control scheme around tap vs hold on one button.** The
+  settings menu was previously behind an A+B chord, which was effectively
+  unreachable: whichever button went down first had already fired its own
+  action (pause, or a filter cycle), so the chord almost never registered as
+  a chord. The chord is gone. Every gesture is now a tap or a ~1s hold on a
+  single button — tap A scrolls, tap B filters, **hold A stops and starts
+  scanning** (the same button gates both directions, instead of stop-on-A /
+  resume-on-B), **hold B opens the settings menu**. Menu nav on A stays
+  hold-free so repeated presses stay instant. Hold detection returns the
+  moment the button comes up, so taps have no added latency — only an actual
+  hold costs the wait.
+- [x] **Made the control scheme discoverable.** A full cheat sheet is drawn on
+  the device: shown for a few seconds at boot (dismissable), available any
+  time from a new **Show Controls** menu row, and printed over serial at boot
+  and via a `controls` command. The findings-screen footer now permanently
+  carries the two gestures nobody can guess at (`HOLD A:Stop`, `HOLD B:Menu`)
+  alongside the active filter. Nothing about the button scheme should require
+  reading the README.
+- [x] **Alert style is now three explicit options, defaulting to the calm one.**
+  The Phase 2 alert work made "loud" mean a 5x full-screen red/blue strobe and
+  offered only a near-invisible quiet mode as the alternative — nothing in
+  between, and the strobe was the default. Alert Style now cycles **Simple**
+  (one solid red screen, no animation — the new default) → **Quiet**
+  (border only, unchanged) → **Loud** (the strobe, now opt-in). Sound split
+  back out into its own menu row: folding it into the same cycle made a
+  4-state toggle whose next state nobody could predict.
+- [x] **Filters pin the view instead of fighting the band switch.** A filter
+  only ever applied to the BLE list, but the screen kept alternating to the
+  unfiltered WiFi list every 3 seconds — which read as the filter switching
+  itself off and back on every few seconds. With a filter active the display
+  now stays on the BLE list; scanning still alternates bands underneath, only
+  the view is pinned. A filter matching nothing now says so instead of
+  rendering a blank screen.
+- [x] **Allowlisting moved from a hidden gesture to a menu row.** Hold-A on the
+  paused list (Phase 2) collided with hold-A's new stop/start job. It's now an
+  **Allowlist Top Device** menu action, which is also strictly more
+  discoverable than an undocumented long-press — and the row displays the tail
+  of the MAC it will act on, so it's a confirmable choice rather than a blind
+  one. Behaviour is otherwise identical (exact-MAC, BLE-only, persisted to
+  `/allowlist.txt`).
+
 ## Already completed (context, not part of this roadmap's phases)
 
 The stability pass that preceded this roadmap: fixed the Core0/Core1 display-and-button
