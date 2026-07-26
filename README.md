@@ -1,7 +1,8 @@
 <div align="center">
   
-  [![Pre-release](https://img.shields.io/github/v/release/lukeswitz/PathShield?include_prereleases&label=pre-release&color=orange)](https://github.com/lukeswitz/PathShield/releases)
-[![GitHub code size in bytes](https://img.shields.io/github/languages/code-size/lukeswitz/PathShield)](https://github.com/lukeswitz/AntiHunter/tree/main/PathShield/)
+  [![Last commit](https://img.shields.io/github/last-commit/d3mocide/PathShield-M5StickS3?color=orange)](https://github.com/d3mocide/PathShield-M5StickS3/commits/main)
+[![GitHub code size in bytes](https://img.shields.io/github/languages/code-size/d3mocide/PathShield-M5StickS3)](https://github.com/d3mocide/PathShield-M5StickS3)
+[![Upstream](https://img.shields.io/badge/upstream-lukeswitz%2FPathShield-blue)](https://github.com/lukeswitz/PathShield)
   
 <img height="500" alt="image" src="https://github.com/user-attachments/assets/0dac6a9f-32a8-4b05-b6a1-b59fc3762f51" />
 
@@ -12,7 +13,9 @@ PathShield is an RF awareness tool for the M5StickS3. It uses BLE/WiFi scanning 
 ---
 
 > [!NOTE]
-> This fork targets the **M5StickS3 exclusively** — the code, web flasher, and docs here assume that hardware and take on breaking changes freely. For M5StickC Plus 1.1 / Plus 2, use the upstream project: [lukeswitz/PathShield](https://github.com/lukeswitz/PathShield).
+> This is a fork of [lukeswitz/PathShield](https://github.com/lukeswitz/PathShield) that targets the
+> **M5StickS3 exclusively** — the code, web flasher, and docs here assume that hardware and take on
+> breaking changes freely. For M5StickC Plus 1.1 / Plus 2, use the upstream project instead.
 
 > [!CAUTION]
 > **ETHICAL USE ONLY**
@@ -481,6 +484,16 @@ went down first fired its own action. If in doubt, the on-device cheat sheet
 
 ## Credits
 
+### Upstream Project
+
+PathShield was created by [**@lukeswitz**](https://github.com/lukeswitz), originally as part of the
+[AntiHunter](https://github.com/lukeswitz/AntiHunter) project and now maintained at
+[lukeswitz/PathShield](https://github.com/lukeswitz/PathShield). This repository is a M5StickS3-only
+fork of it. All of the original design work — the detection pipeline, the persistence scoring model,
+the UI, and the web flasher — comes from upstream. Please star and support the original project.
+
+### Detection Research
+
 Detection algorithms based on:
 - [Chasing-Your-Tail-NG](https://github.com/ArgeliusLabs/Chasing-Your-Tail-NG) - Persistence tracking
 - [BLE-Doubt](https://arxiv.org/abs/2205.12235) - Topological classification
@@ -499,6 +512,7 @@ See [ROADMAP.md](ROADMAP.md) for planned UX/product enhancements, phased by impa
 
 ## Support
 
-- GitHub Issues: Bug reports and feature requests
+- [GitHub Issues](https://github.com/d3mocide/PathShield-M5StickS3/issues): Bug reports and feature requests for this M5StickS3 fork
 - Serial Monitor: Enable debugging (115200 baud)
-- [Web Flasher](https://lukeswitz.github.io/PathShield/)
+- [Web Flasher](https://d3mocide.github.io/PathShield-M5StickS3/)
+- Upstream (M5StickC Plus 1.1 / Plus 2): [lukeswitz/PathShield](https://github.com/lukeswitz/PathShield) — report hardware-agnostic bugs there too
