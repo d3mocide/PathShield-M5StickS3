@@ -61,12 +61,38 @@ PathShield is an RF awareness tool for the M5StickS3. It uses BLE/WiFi scanning 
 
 1. Open link in Chrome, Edge, or Opera (not Safari/Firefox)
 2. Connect M5StickS3 via USB-C
-3. Click "Deploy Firmware"
-4. Select serial port, wait ~2 minutes
+3. Pick **STABLE** or **BETA** (see below) — stable is selected by default
+4. Click "Deploy Firmware"
+5. Select serial port, wait ~2 minutes
 
-The page shows the version it will install (read live from `manifest.json`).
-To confirm what actually landed on the device, check the boot splash, or open
-**Settings** (hold Button B) — the version is in the top-right corner.
+The page shows the version each channel will install, read live from that
+channel's manifest, so it can never advertise a build different from the one it
+flashes. To confirm what actually landed on the device, check the boot splash,
+or open **Settings** (hold Button B) — the version is in the top-right corner.
+
+#### Stable vs Beta
+
+| | Stable | Beta |
+|---|---|---|
+| **Manifest** | `manifest.json` | `manifest-beta.json` |
+| **Binary** | `firmware.bin` | `firmware-beta.bin` |
+| **What it is** | The last build verified on hardware | Latest build from `main` |
+
+Both channels share the same `bootloader.bin`, `partitions.bin` and
+`boot_app0.bin` — those are byte-identical between builds, so only the
+application image differs.
+
+**Switching back is just re-flashing.** If a beta build misbehaves, select
+STABLE on the same page and flash again; there's nothing to uninstall. Both
+channels erase the device first, so settings in SPIFFS (`/prefs.txt`,
+`/allowlist.txt`, `/specialmacs.txt`, `/incidents.txt`) do **not** survive
+either way — export anything you want to keep with `dump` first.
+
+> [!NOTE]
+> The source in this repository is always the **beta**. `FIRMWARE_VERSION` in
+> `PathShield.ino` therefore tracks `manifest-beta.json`, not `manifest.json` —
+> stable is a frozen earlier artifact, deliberately left behind until a beta has
+> been shown to work on real hardware.
 
 > [!NOTE]
 > The URL is case-sensitive. `d3mocide.github.io/pathshield-m5sticks3/` (all
@@ -514,11 +540,25 @@ of that — while `manifest.json` is only cached for 10 minutes. So the flasher
 could read a fresh manifest claiming the new version and then install a stale
 binary straight out of cache.
 
-The manifest now appends a `?v=<version>` query string to every binary path,
+The manifests now append a `?v=<version>` query string to every binary path,
 which makes each release a distinct URL that no cache can satisfy from a
-previous one. **When cutting a release, bump the version in all three places
-or this comes back:** `FIRMWARE_VERSION` in `PathShield.ino`, and both the
-`version` field *and* every `?v=` in `docs/manifest.json`.
+previous one.
+
+**Release checklist — miss one of these and the stale-binary bug comes back:**
+
+*Cutting a beta (the usual case — the repo source is always the beta):*
+1. `FIRMWARE_VERSION` in `PathShield.ino`
+2. The `version` field in `docs/manifest-beta.json`
+3. Every `?v=` in `docs/manifest-beta.json`
+4. Rebuild `docs/firmware-beta.bin` from that source
+
+*Promoting a beta to stable, once it's been verified on hardware:*
+1. Copy `docs/firmware-beta.bin` over `docs/firmware.bin`
+2. Set `docs/manifest.json`'s `version` and every `?v=` to the promoted version
+
+`bootloader.bin`, `partitions.bin` and `boot_app0.bin` are shared by both
+channels and only change if the board package or partition scheme does — verify
+with `cmp` against a fresh build rather than assuming either way.
 
 To confirm what's actually on the device: the boot splash shows the version,
 and so does the top-right corner of the settings screen (hold Button B). If

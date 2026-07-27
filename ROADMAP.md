@@ -241,8 +241,28 @@ exposed.
   grounds that a frozen list is a weaker use of the screen than a full record
   of one device — and the list is still there while scanning.
 
+## Phase 8 — Release channels on the web flasher
+
+- [x] **Stable/beta channel picker.** The flasher installed whatever was in
+  `docs/`, so shipping anything meant overwriting the only build users could
+  get — and there was no way back to a known-good one except a git checkout.
+  The page now carries two channels, each with its own manifest, and switches
+  the install button between them: `manifest.json` (stable, the last build
+  verified on hardware) and `manifest-beta.json` (beta, latest from `main`).
+  Both share `bootloader.bin`/`partitions.bin`/`boot_app0.bin`, which are
+  byte-identical between builds, so only the application image is duplicated.
+  Stable is the default; selecting beta shows a warning that says how to get
+  back. Rolling back is just re-flashing from the same page.
+
+  Kept `manifest.json` as the stable path deliberately: it's what existing
+  links, bookmarks and the README already point at, so nothing outside the repo
+  breaks. `FIRMWARE_VERSION` in the source tracks the *beta* manifest, since the
+  repo source is always the beta and stable is a deliberately frozen artifact.
+
 ### Still open
 
+- [ ] **Promote 2.5.0 to stable once it's been run on hardware.** It is
+  currently beta-only and has never booted.
 - [ ] **IMU-based motion correlation.** Carried over from Phase 3.
 
 ## Already completed (context, not part of this roadmap's phases)
