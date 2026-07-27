@@ -125,6 +125,146 @@ Once it was, three things turned out to be wrong in practice rather than on pape
   one. Behaviour is otherwise identical (exact-MAC, BLE-only, persisted to
   `/allowlist.txt`).
 
+## Phase 5 — Render quality, alert availability, and the WiFi detection gap
+
+A code review of the whole firmware turned up three problems that are less about
+missing features than about the device not doing what it already claims to do.
+Phase 4 fixed what field testing exposed; these are what reading the code exposed.
+
+- [ ] **Flicker-free rendering via a PSRAM sprite.** Every render did
+  `M5.Display.fillScreen(BLACK)` and then repainted the whole screen field by
+  field, once a second — a visible black flash on every update, on the findings
+  list, the top bar and the settings menu alike. The repainting screens now draw
+  into a 240x135x16bpp `M5Canvas` held in PSRAM (~65KB, which the S3 has in
+  abundance and which doesn't touch the internal heap the MEM bar tracks) and
+  reach the panel as a single `pushSprite()`. Redraws also get *faster*: one bulk
+  SPI transfer instead of a few hundred small ones. Scoped to the screens that
+  repaint on a timer — the boot splash, controls sheet, feedback toasts and alert
+  screen are drawn once and left up, so they never flickered and stay on direct
+  rendering rather than being churned for consistency's sake.
+- [ ] **An alert no longer blinds the device until someone presses a button.**
+  `alertUser()` blocked on a button press with no timeout while `scanTask` spun on
+  `showingAlert`, so the moment PathShield detected something was the moment it
+  stopped looking — indefinitely, if it was in a pocket. For an anti-stalking tool
+  that is exactly backwards. The alert now auto-dismisses (the `ALERT_DURATION`
+  constant had been declared and left unused since the stability pass) and scanning
+  resumes. Because a dismissed alert shouldn't vanish without a trace, the findings
+  screen draws its border in red with an `!N` count while any alert is
+  unacknowledged, clearing once the user looks at the ALERTS filter. The border was
+  chosen over a banner row deliberately: at 240x135 the footer is already carrying
+  the filter tag, both hold hints and the page counter, and the screen edge was
+  otherwise decorative.
+- [ ] **WiFi BSSIDs are matched against the special-MAC list.** `isSpecialMac()`
+  was only ever called from `trackDevice()` — the BLE path. The Axon and Flock
+  OUIs that ship in `defaultSpecialMacs[]` therefore never alerted over WiFi,
+  despite the README billing them as "Privacy Invader Defaults" and the web
+  flasher's threat matrix listing `Axon TASER | WiFi/BLE | DETECTED`. Flock
+  cameras beacon over WiFi. This closes the largest gap between what the project
+  documents and what it does. Carries two necessary companions: the allowlist
+  (both compiled-in prefixes and the runtime list) now applies to WiFi BSSIDs
+  too, since otherwise a WiFi false positive would have no off switch; and
+  alerting WiFi entries survive `removeOldWiFiEntries()`, matching how the BLE
+  list already preserves `alertTriggered` devices.
+- [ ] **The ALERTS filter covers both bands.** Follows directly from the item
+  above: the filter pinned the view to BLE, so a WiFi hit would have been
+  invisible under the filter named "Alerts". It now renders BLE and WiFi
+  alerting devices as one combined, band-tagged list.
+
+## Phase 6 — Second review pass
+
+Smaller corrections from the same review, plus the two documentation gaps it
+exposed.
+
+- [x] **Stopping merges the two lists.** `isWifiView()` keyed off `scanningWiFi`,
+  which is frozen while paused — so pausing during a BLE window pinned you to
+  BLE with the WiFi list unreachable until you resumed. While stopped there is
+  no band alternation to follow, so the view now shows one combined list, each
+  row tagged `[BLE]`/`[WiFi]`, reusing the merged renderer built for the ALERTS
+  filter. Fixes the band problem without inventing a gesture — every button is
+  already assigned in both scanning and paused modes.
+- [x] **Scrolling advances a page, not a row.** At three rows per screen,
+  stepping by one meant 67 taps to walk a 70-device list, re-rendering two rows
+  the reader had already read each time.
+- [x] **Battery percentage via `M5.Power.getBatteryLevel()`, smoothed.** The old
+  `(V - 3.0) / 1.2` lerp treats a lithium discharge curve as a straight line, so
+  it read high for most of a session and then fell off a cliff; unfiltered
+  samples redrawn every second also visibly jittered. Now uses M5Unified's
+  curve with an exponential moving average, in one helper shared by the top bar
+  and the settings screen instead of duplicated between them. The
+  critical-battery shutdown moved out of `drawTopBar()` into `loop()` — a render
+  function had no business powering the device off, and it did so while holding
+  `deviceMutex` across a 3-second delay.
+- [x] **Signal strength as bars or dBm, switchable.** A new **Signal Display**
+  menu row cycles BARS/dBm. Bars answer "is it getting closer?" at a glance;
+  dBm is what you want comparing two devices or writing a finding down — so
+  it's a preference, not a replacement. Persisted to `/prefs.txt`.
+- [x] **Inverse-video menu selection.** A single `>` in the margin is easy to
+  lose at this size; the highlighted row now reads from across a room. Row
+  height dropped to 9px to fit the tenth option in 135px.
+- [x] **"You got an alert — now what?" in the README.** For an anti-stalking
+  tool the response guidance matters as much as the detection, and there was
+  none: no way to tell a commuter from a follower, no capture-then-report
+  sequence, and nothing saying plainly that a quiet screen isn't proof of
+  safety. Leads with the boring explanations, because most alerts are the
+  user's own earbuds.
+- [x] **Web flasher accessibility and metadata.** The body-wide opacity flicker
+  and sweeping scanline now stop under `prefers-reduced-motion` — persistent
+  motion of exactly the kind that triggers migraine and vestibular symptoms, on
+  a page whose only job is one button. Added a description, favicon and OG tags
+  so shared links preview as something; replaced the stale hardcoded "2024".
+
+## Phase 7 — Detail view and getting the render off the lock
+
+- [x] **Rendering no longer holds `deviceMutex`.** `displayTrackedDevices()` ran
+  start to finish with the mutex held, including every SPI write to the panel,
+  while `scanTask` on Core 0 needs that same mutex to record what it just
+  scanned and gives up after 2000ms — so a slow frame could make an entire scan
+  batch get silently discarded. The frame is now built in two halves: a
+  `FrameSnapshot` of just the rows about to be drawn, copied under the lock,
+  then rendering from that copy with no lock held. Invisible on screen; the
+  point is that updating the display no longer costs detections.
+- [x] **The per-frame sort only orders what's visible.** The bubble sort over
+  every tracked device (~2,400 comparisons at 70 devices, re-run every frame
+  inside the lock above) is now a `std::partial_sort` over just the window being
+  displayed. Same ordering, a fraction of the work, and what remains happens in
+  the short snapshot phase rather than across the whole draw.
+- [x] **Stopping the scan is now a per-device detail view.** All four gestures
+  were already assigned in both scanning and paused modes, so there was no
+  button left to open a detail view with. Rather than overload one — Phase 4
+  already established that hidden gestures on this device don't get found —
+  stopping now means "inspect": one device per screen with the untruncated
+  MAC/BSSID, vendor, tracker type, signal now plus its min/max/average range,
+  detection count, time since first seen, and the persistence score against the
+  threshold it has to beat. Tap A steps through devices, so scrolling is
+  unchanged in feel; there's just one device per step. Filters still apply.
+  Trade-off accepted: you no longer get a frozen three-row overview, on the
+  grounds that a frozen list is a weaker use of the screen than a full record
+  of one device — and the list is still there while scanning.
+
+## Phase 8 — Release channels on the web flasher
+
+- [x] **Stable/beta channel picker.** The flasher installed whatever was in
+  `docs/`, so shipping anything meant overwriting the only build users could
+  get — and there was no way back to a known-good one except a git checkout.
+  The page now carries two channels, each with its own manifest, and switches
+  the install button between them: `manifest.json` (stable, the last build
+  verified on hardware) and `manifest-beta.json` (beta, latest from `main`).
+  Both share `bootloader.bin`/`partitions.bin`/`boot_app0.bin`, which are
+  byte-identical between builds, so only the application image is duplicated.
+  Stable is the default; selecting beta shows a warning that says how to get
+  back. Rolling back is just re-flashing from the same page.
+
+  Kept `manifest.json` as the stable path deliberately: it's what existing
+  links, bookmarks and the README already point at, so nothing outside the repo
+  breaks. `FIRMWARE_VERSION` in the source tracks the *beta* manifest, since the
+  repo source is always the beta and stable is a deliberately frozen artifact.
+
+### Still open
+
+- [ ] **Promote 2.5.0 to stable once it's been run on hardware.** It is
+  currently beta-only and has never booted.
+- [ ] **IMU-based motion correlation.** Carried over from Phase 3.
+
 ## Already completed (context, not part of this roadmap's phases)
 
 The stability pass that preceded this roadmap: fixed the Core0/Core1 display-and-button

@@ -10,12 +10,71 @@
 #define SCREEN_HEIGHT 135
 #define DEFAULT_SCREEN_TIMEOUT 30000
 
+// Off-screen frame buffer for the screens that repaint on a timer (top bar,
+// findings list, settings menu). Those used to clear the panel and then redraw
+// it field by field once a second, which read as a black flash on every single
+// update. They now compose into this sprite and reach the panel as one
+// pushSprite() — no flicker, and fewer SPI transfers than the per-field repaint
+// it replaces. 240x135 at 16bpp is ~65KB, held in PSRAM so it doesn't come out
+// of the internal heap that the MEM bar reports.
+//
+// Screens drawn once and left up (boot splash, controls sheet, feedback toasts,
+// the alert screen) never flickered, so they keep rendering straight to the
+// panel rather than being churned for the sake of consistency.
+//
+// frame() and framePush(), which hand out the surface to draw on, are defined
+// much further down next to the render functions: the Arduino preprocessor
+// hoists its generated prototypes above the first function *definition* in the
+// file, so defining either here would lift every prototype above the enums and
+// structs they reference.
+M5Canvas frameCanvas(&M5.Display);
+bool canvasReady = false;
+
+// One row of the findings list, copied out of the live device arrays so that
+// drawing it doesn't need deviceMutex held — see displayTrackedDevices().
+// Declared up here, above the first function definition, because Arduino's
+// generated prototypes are inserted at that point and would otherwise name
+// these types before they exist.
+struct RowSnapshot {
+  bool isWifi;
+  bool detected;
+  bool isSpecial;
+  char name[33];  // BLE device name, or SSID
+  char address[18];
+  char manufacturer[31];
+  uint8_t trackerType;
+  float score;
+  unsigned long firstSeen;
+  int totalCount;
+  int rssi;
+  int minRssi;
+  int maxRssi;
+  int avgRssi;
+  int channel;
+  int encryptionType;
+};
+
+// Everything one frame of the findings screen needs to draw itself. Built under
+// the mutex, rendered after it's released.
+struct FrameSnapshot {
+  RowSnapshot rows[3];
+  int rowsFilled;
+  int totalItems;
+  int scrollIndex;
+  bool wifiView;
+  bool merged;
+  bool alertsOnly;
+  bool nothingTracked;
+  int bleTracked;
+  int wifiTracked;
+};
+
 // Single source of truth for the version. Shown on the boot splash, in the
 // settings header, and over serial at boot, so you can confirm on-device which
 // build is actually running. Keep this in step with docs/manifest.json —
 // including the cache-busting `?v=` on its firmware paths, or the web flasher
 // will happily reinstall a stale binary from CDN cache.
-#define FIRMWARE_VERSION "2.4.1"
+#define FIRMWARE_VERSION "2.5.0"
 
 // M5StickS3 always has 8MB PSRAM, so device limits are fixed at boot.
 #define MAX_DEVICES_CAP 70
@@ -70,8 +129,10 @@ const unsigned long DEBOUNCE_DELAY = 200;
 bool inMenu = false;
 int menuIndex = 0;
 int menuBaseY = 0;
-#define MENU_OPTION_COUNT 9
-#define MENU_ROW_H 10
+#define MENU_OPTION_COUNT 10
+// 9px rows fit ten options plus the status line, divider and footer hint in
+// 135px; the 8px font leaves a 1px gap. At 10px the tenth row ran off screen.
+#define MENU_ROW_H 9
 
 // How long a button must stay down to count as a hold rather than a tap.
 // Every hold gesture uses this one value so "hold" means the same thing
@@ -91,6 +152,12 @@ enum AlertStyle : uint8_t { ALERT_LOUD = 0, ALERT_SIMPLE = 1, ALERT_QUIET = 2 };
 AlertStyle alertStyle = ALERT_SIMPLE;
 bool alertSoundEnabled = true;
 
+// How signal strength reads on the findings list: a four-bar glyph, or the raw
+// dBm figure. Bars are quicker to judge at a glance ("is it getting closer?"),
+// dBm is what you want when comparing two devices or reporting a finding — so
+// this is a preference rather than a replacement. Persisted to /prefs.txt.
+bool showSignalBars = true;
+
 const char *alertStyleName(AlertStyle style) {
   switch (style) {
     case ALERT_LOUD:  return "LOUD";
@@ -104,14 +171,21 @@ unsigned long lastButtonPressTime = 0;
 unsigned long lastActivityTime = 0;
 bool screenOn = true;
 unsigned long screenTimeoutMs = DEFAULT_SCREEN_TIMEOUT;
-volatile bool deviceDataChanged = false;
 static uint32_t lastStateHash = 0;
 unsigned long lastDisplayRender = 0;
 unsigned long lastMenuRender = 0;
 
-bool alertActive = false;
-unsigned long alertStartTime = 0;
-const unsigned long ALERT_DURATION = 5000;
+// How long a tracker alert stays up before standing down on its own. Long
+// enough to read the type, name, MAC and score off the screen; short enough
+// that an alert nobody is present to acknowledge doesn't keep the scanner
+// parked. A button press still dismisses it immediately.
+const unsigned long ALERT_DURATION = 8000;
+
+// Alerts that timed out instead of being acknowledged by hand. The findings
+// screen keeps a red border and an !N badge up while this is non-zero, so an
+// alert that fired while the device was in a pocket still leaves a trace.
+// Cleared by looking at the ALERTS filter.
+int unackedAlertCount = 0;
 
 // Alert handoff from scanTask (Core 0) to loop() (Core 1).
 // All M5.Display / M5.update() calls must happen on Core 1 only — scanTask
@@ -122,6 +196,10 @@ struct PendingAlertInfo {
   char mac[18];
   float score;
   uint8_t trackerType;
+  // Which band found it. The alert screen labels the identifier accordingly —
+  // "BSSID" is not a MAC the BLE allowlist could ever act on, and saying so
+  // saves the reader working out why.
+  bool isWifi;
 };
 PendingAlertInfo pendingAlertInfo;
 volatile bool alertPending = false;
@@ -135,6 +213,11 @@ struct WiFiDeviceInfo {
   int encryptionType;
   unsigned long lastSeen;
   int detectionCount;
+  // Matched a specialMacs[] prefix. There's no persistence scoring on the WiFi
+  // side — a privacy-invader OUI is an immediate hit, the same way it is for
+  // BLE — so these two carry all the alert state a WiFi entry needs.
+  bool isSpecial;
+  bool alertTriggered;
 };
 
 WiFiDeviceInfo *wifiDevices = NULL;
@@ -174,6 +257,23 @@ const char* trackerTypeName(uint8_t type) {
     case TRACKER_PRIVACY_INVADER:return "Privacy Inv";
     case TRACKER_PERSISTENCE:    return "Persistence";
     default:                     return "Unknown";
+  }
+}
+
+const char *wifiAuthName(int encryptionType) {
+  switch (encryptionType) {
+    case WIFI_AUTH_OPEN:            return "OPEN";
+    case WIFI_AUTH_WEP:             return "WEP";
+    case WIFI_AUTH_WPA_PSK:         return "WPA";
+    case WIFI_AUTH_WPA2_PSK:        return "WPA2";
+    case WIFI_AUTH_WPA_WPA2_PSK:    return "WPA/2";
+    case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2-E";
+    case WIFI_AUTH_WPA3_PSK:        return "WPA3";
+    case WIFI_AUTH_WPA2_WPA3_PSK:   return "WPA2/3";
+    case WIFI_AUTH_WAPI_PSK:        return "WAPI";
+    case WIFI_AUTH_OWE:             return "OWE";
+    case WIFI_AUTH_WPA3_ENT_192:    return "WPA3-E";
+    default:                        return "UNK";
   }
 }
 
@@ -276,9 +376,17 @@ class MyScanCallbacks : public NimBLEScanCallbacks {
   void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {}
 };
 
+// Case-insensitive, and it has to be: NimBLE renders addresses lowercase
+// ("%02x") while WiFi.BSSIDstr() renders them uppercase ("%02X"), and the
+// prefixes these are matched against are written uppercase — in
+// defaultSpecialMacs[], in allowlistMacs[], in the README, and in whatever a
+// user types at the `special add` / `allow add` serial commands. A plain
+// strncmp therefore never matched a BLE address against any prefix containing
+// a hex letter, which is all three shipped defaults. getManufacturer() in
+// MacPrefixes.h already normalises case for exactly this reason.
 bool isSpecialMac(const char *address) {
   for (int i = 0; i < specialMacsCount; i++) {
-    if (strncmp(address, specialMacs[i], strlen(specialMacs[i])) == 0) {
+    if (strncasecmp(address, specialMacs[i], strlen(specialMacs[i])) == 0) {
       return true;
     }
   }
@@ -288,12 +396,12 @@ bool isSpecialMac(const char *address) {
 bool isAllowlistedMac(const char *address) {
   for (size_t i = 0; i < sizeof(allowlistMacs) / sizeof(allowlistMacs[0]); i++) {
     if (strlen(allowlistMacs[i]) > 0 &&
-        strncmp(address, allowlistMacs[i], strlen(allowlistMacs[i])) == 0) {
+        strncasecmp(address, allowlistMacs[i], strlen(allowlistMacs[i])) == 0) {
       return true;
     }
   }
   for (int i = 0; i < runtimeAllowlistCount; i++) {
-    if (strcmp(address, runtimeAllowlist[i]) == 0) {
+    if (strcasecmp(address, runtimeAllowlist[i]) == 0) {
       return true;
     }
   }
@@ -368,14 +476,28 @@ uint8_t detectTrackerType(const NimBLEAdvertisedDevice &device) {
   return TRACKER_NONE;
 }
 
-void trackWiFiDevice(const char *ssid, const char *bssid, int rssi, int channel,
+// Returns true when this sighting is a *new* privacy-invader hit the caller
+// should raise an alert for. isSpecialMac() was previously only ever consulted
+// on the BLE path, so the Axon and Flock OUIs that ship in defaultSpecialMacs[]
+// never fired over WiFi — despite the README billing them as "Privacy Invader
+// Defaults" and the web flasher's threat matrix listing them as WiFi/BLE. Flock
+// cameras beacon over WiFi. There's no persistence scoring here: a matching OUI
+// is an immediate hit, the same as it is for BLE.
+bool trackWiFiDevice(const char *ssid, const char *bssid, int rssi, int channel,
                      int encType, unsigned long currentTime) {
+  bool special = isSpecialMac(bssid);
+
   for (int i = 0; i < wifiDeviceIndex; i++) {
-    if (strcmp(wifiDevices[i].bssid, bssid) == 0) {
+    if (strcasecmp(wifiDevices[i].bssid, bssid) == 0) {
       wifiDevices[i].rssi = rssi;
       wifiDevices[i].lastSeen = currentTime;
       wifiDevices[i].detectionCount++;
-      return;
+      wifiDevices[i].isSpecial = special;
+      if (special && !wifiDevices[i].alertTriggered) {
+        wifiDevices[i].alertTriggered = true;
+        return true;
+      }
+      return false;
     }
   }
 
@@ -389,12 +511,18 @@ void trackWiFiDevice(const char *ssid, const char *bssid, int rssi, int channel,
     wifiDevices[wifiDeviceIndex].encryptionType = encType;
     wifiDevices[wifiDeviceIndex].lastSeen = currentTime;
     wifiDevices[wifiDeviceIndex].detectionCount = 1;
+    wifiDevices[wifiDeviceIndex].isSpecial = special;
+    wifiDevices[wifiDeviceIndex].alertTriggered = special;
     wifiDeviceIndex++;
+    return special;
   } else {
     int oldestIndex = -1;
     unsigned long oldestTime = currentTime;
 
+    // Never evict an alerting entry to make room for a routine one — it's the
+    // one row on this list that matters.
     for (int i = 0; i < wifiDeviceIndex; i++) {
+      if (wifiDevices[i].alertTriggered) continue;
       if (wifiDevices[i].lastSeen < oldestTime) {
         oldestTime = wifiDevices[i].lastSeen;
         oldestIndex = i;
@@ -411,12 +539,22 @@ void trackWiFiDevice(const char *ssid, const char *bssid, int rssi, int channel,
       wifiDevices[oldestIndex].encryptionType = encType;
       wifiDevices[oldestIndex].lastSeen = currentTime;
       wifiDevices[oldestIndex].detectionCount = 1;
+      wifiDevices[oldestIndex].isSpecial = special;
+      wifiDevices[oldestIndex].alertTriggered = special;
+      return special;
     }
   }
+
+  return false;
 }
 
 void removeOldWiFiEntries(unsigned long currentTime) {
   for (int i = 0; i < wifiDeviceIndex; i++) {
+    // Alerting entries are kept, matching how removeOldEntries() preserves
+    // alertTriggered BLE devices — an alert you walked out of range of is still
+    // the thing you want on screen when you look down.
+    if (wifiDevices[i].alertTriggered) continue;
+
     if (currentTime - wifiDevices[i].lastSeen > DETECTION_WINDOW) {
       for (int j = i; j < wifiDeviceIndex - 1; j++) {
         wifiDevices[j] = wifiDevices[j + 1];
@@ -782,7 +920,8 @@ void removeOldKnownEntries(unsigned long currentTime) {
 }
 
 void alertUser(bool isSpecial, const char *name, const char *mac,
-               float persistence, uint8_t tType = TRACKER_NONE) {
+               float persistence, uint8_t tType = TRACKER_NONE,
+               bool isWifi = false) {
 
   screenOn = true;
   lastActivityTime = millis();
@@ -839,24 +978,61 @@ void alertUser(bool isSpecial, const char *name, const char *mac,
   M5.Display.setTextColor(WHITE);
 
   M5.Display.setCursor(0, 55);
-  M5.Display.print("Name: ");
+  M5.Display.print(isWifi ? "SSID: " : "Name: ");
   M5.Display.print(strlen(name) > 0 ? name : "Unknown");
 
   M5.Display.setCursor(0, 70);
-  M5.Display.print("MAC: ");
+  M5.Display.print(isWifi ? "BSSID: " : "MAC: ");
   M5.Display.print(mac);
 
   M5.Display.setCursor(0, 85);
-  M5.Display.print("Score: ");
-  M5.Display.print(persistence, 2);
+  // A WiFi hit is an OUI match, not a persistence score — printing "Score:
+  // 1.00" would imply a calculation that never ran.
+  if (isWifi) {
+    M5.Display.print("Band: WiFi Ch/OUI match");
+  } else {
+    M5.Display.print("Score: ");
+    M5.Display.print(persistence, 2);
+  }
 
-  M5.Display.setCursor(0, 105);
-  M5.Display.setTextColor(YELLOW);
-  M5.Display.print("Press any button");
+  // Bounded wait. This used to block on a button press with no timeout, and
+  // scanTask parks on showingAlert until it returns — so the moment PathShield
+  // found something was the moment it stopped looking, indefinitely if the
+  // device was in a pocket. For an anti-stalking tool that is exactly
+  // backwards. The alert now stands down on its own and scanning resumes; the
+  // countdown says so, and an unacknowledged alert leaves the findings screen
+  // marked rather than vanishing silently.
+  uint16_t bgColor = (alertStyle == ALERT_QUIET) ? BLACK : RED;
+  unsigned long alertShownAt = millis();
+  bool acknowledged = false;
+  int lastSecondsShown = -1;
 
-  while (!M5.BtnA.wasPressed() && !M5.BtnB.wasPressed()) {
+  while (true) {
+    unsigned long elapsed = millis() - alertShownAt;
+    if (elapsed >= ALERT_DURATION) break;
+
     M5.update();
+    if (M5.BtnA.wasPressed() || M5.BtnB.wasPressed()) {
+      acknowledged = true;
+      break;
+    }
+
+    int secondsLeft = (int)((ALERT_DURATION - elapsed + 999) / 1000);
+    if (secondsLeft != lastSecondsShown) {
+      lastSecondsShown = secondsLeft;
+      // Inset so repainting the countdown doesn't eat the Quiet-mode border
+      // (or the special-device orange frame) running down either edge.
+      M5.Display.fillRect(3, 105, SCREEN_WIDTH - 6, 10, bgColor);
+      M5.Display.setCursor(3, 105);
+      M5.Display.setTextColor(YELLOW);
+      M5.Display.printf("Any button  (%ds)", secondsLeft);
+    }
+
     delay(50);
+  }
+
+  if (!acknowledged && unackedAlertCount < 99) {
+    unackedAlertCount++;
   }
 
   // Force display reset after alert dismissal to prevent race condition
@@ -915,12 +1091,12 @@ void drawControlsScreen() {
 
   M5.Display.setTextColor(WHITE);
   M5.Display.setCursor(2, 28);
-  M5.Display.print(" A       Scroll list");
+  M5.Display.print(" A       Next page / next device");
   M5.Display.setCursor(2, 38);
   M5.Display.print(" B       Filter: All/Named/Alerts");
   M5.Display.setTextColor(GREEN);
   M5.Display.setCursor(2, 48);
-  M5.Display.print(" HOLD A  Stop / start scanning");
+  M5.Display.print(" HOLD A  Stop (detail view) / start");
   M5.Display.setCursor(2, 58);
   M5.Display.print(" HOLD B  Open settings menu");
 
@@ -973,9 +1149,9 @@ void showControlsScreen(unsigned long timeoutMs) {
 void printControlsToSerial() {
   Serial.println("--- PathShield controls (HOLD = press for 1 second) ---");
   Serial.println("  Scanning / list:");
-  Serial.println("    A         Scroll the list");
+  Serial.println("    A         Next page of the list (next device when stopped)");
   Serial.println("    B         Cycle filter: All -> Named -> Alerts");
-  Serial.println("    HOLD A    Stop / start scanning");
+  Serial.println("    HOLD A    Stop / start scanning (stopped = per-device detail)");
   Serial.println("    HOLD B    Open the settings menu");
   Serial.println("  Settings menu:");
   Serial.println("    A         Next option");
@@ -1066,6 +1242,35 @@ bool isWifiView() {
   return scanningWiFi && filterMode == FILTER_ALL;
 }
 
+// Two cases draw a single list merged across both bands, so they are neither
+// the WiFi view nor the BLE view:
+//
+//   - the ALERTS filter, so a WiFi privacy-invader hit isn't hidden by a
+//     filter named "Alerts";
+//   - anything paused, because the band the view happens to be pinned to when
+//     you stop scanning is arbitrary. isWifiView() keys off scanningWiFi, which
+//     is frozen while paused, so pausing during a BLE window used to strand you
+//     on BLE with no way to reach the WiFi list at all.
+bool isMergedView() {
+  return filterMode == FILTER_ALERTS || paused;
+}
+
+// Whether the merged view shows everything or only what's flagged. Pausing is
+// for looking over what you caught, so it shows the lot; the ALERTS filter is
+// for cutting to what matters, so it doesn't.
+bool mergedViewAlertsOnly() {
+  return filterMode == FILTER_ALERTS;
+}
+
+// Top-bar label. In the merged alerts view the screen isn't showing one band's
+// list, so report the band actually being scanned rather than mislabelling the
+// view as one or the other.
+const char *scanModeLabel() {
+  if (paused) return "PAUSE";
+  if (isMergedView()) return scanningWiFi ? "WiFi" : "BLE";
+  return displayingWifiView ? "WiFi" : "BLE";
+}
+
 const char *filterLabel(FilterMode mode) {
   switch (mode) {
     case FILTER_NAMED:  return "NAMED";
@@ -1082,41 +1287,87 @@ uint16_t filterColor(FilterMode mode) {
   }
 }
 
-void drawTopBar() {
-  M5.Display.drawFastHLine(0, 0, SCREEN_WIDTH, CYAN);
-  M5.Display.drawFastHLine(0, 1, SCREEN_WIDTH, CYAN);
+// Battery percentage, smoothed. Two things were wrong with reading it inline:
+// the old (V - 3.0) / 1.2 lerp treats a lithium cell's discharge curve as a
+// straight line, so it reads high for most of a session and then falls off a
+// cliff; and an unfiltered sample redrawn every second visibly jitters.
+// M5Unified's getBatteryLevel() already does the curve properly for this
+// hardware, so this just guards it and applies an exponential moving average.
+// Returns 0-100.
+int batteryPercent() {
+  static float smoothed = -1.0f;
 
-  M5.Display.setTextSize(1);
-  M5.Display.setCursor(4, 3);
-  M5.Display.setTextColor(paused ? RED : GREEN);
-  M5.Display.print(paused ? "PAUSE" : (displayingWifiView ? "WiFi" : "BLE"));
+  int32_t level = M5.Power.getBatteryLevel();
 
-  static float lastValidBatVoltage = 3.7f;
-  float batVoltage = M5.Power.getBatteryVoltage() / 1000.0f;
+  // Negative means the driver couldn't read it; keep the last good value
+  // rather than flashing a bogus 0% and tripping the low-battery path.
+  if (level < 0 || level > 100) {
+    return (smoothed < 0.0f) ? 100 : (int)(smoothed + 0.5f);
+  }
 
-  // Filter out obviously bad readings (sensor errors), but allow real low battery
-  if (batVoltage > 2.0f && batVoltage < 4.5f) {
-    lastValidBatVoltage = batVoltage;
+  if (smoothed < 0.0f) {
+    smoothed = (float)level;
   } else {
-    batVoltage = lastValidBatVoltage;
+    smoothed += ((float)level - smoothed) * 0.2f;
   }
+  return (int)(smoothed + 0.5f);
+}
 
-  // Critical battery check - force shutdown if critically low
-  if (batVoltage < 3.0f && batVoltage > 2.0f) {
-    M5.Display.fillScreen(RED);
-    M5.Display.setTextSize(2);
-    M5.Display.setTextColor(WHITE);
-    M5.Display.setCursor(10, 50);
-    M5.Display.print("LOW BATTERY!");
-    M5.Display.setCursor(20, 80);
-    M5.Display.print("SHUTTING DOWN");
-    delay(3000);
-    M5.Power.powerOff();
+// The surface the repainting screens draw into. Both M5GFX and M5Canvas derive
+// from LovyanGFX, so this is the sprite when it allocated and the panel itself
+// when it didn't — same output either way, the fallback just flickers like it
+// used to instead of failing to draw at all.
+inline LovyanGFX &frame() {
+  return canvasReady ? static_cast<LovyanGFX &>(frameCanvas)
+                     : static_cast<LovyanGFX &>(M5.Display);
+}
+
+// Send a composed frame to the panel. No-op on the fallback path, where the
+// drawing already went straight there.
+inline void framePush() {
+  if (canvasReady) frameCanvas.pushSprite(0, 0);
+}
+
+// Signal strength as a four-bar glyph, drawn from (x, y) in a 21x8 box so it
+// occupies roughly the same width as the "-75dB" text it replaces. Thresholds
+// are the usual BLE/WiFi rules of thumb: -60 and up is close, -70 nearby,
+// -80 present-but-distant, below that is at the edge of RSSI_FLOOR.
+void drawSignalBars(LovyanGFX &gfx, int x, int y, int rssi, uint16_t color) {
+  int bars = 1;
+  if (rssi >= -60)      bars = 4;
+  else if (rssi >= -70) bars = 3;
+  else if (rssi >= -80) bars = 2;
+
+  for (int i = 0; i < 4; i++) {
+    int h = 2 + i * 2;
+    int bx = x + i * 5;
+    int by = y + (8 - h);
+    if (i < bars) {
+      gfx.fillRect(bx, by, 4, h, color);
+    } else {
+      // Unlit bars still drawn, so the glyph reads as "1 of 4" rather than as
+      // a shape that changes size with the signal.
+      gfx.drawRect(bx, by, 4, h, BLUE_GREY);
+    }
   }
+}
 
-  int batPercent = (int)((batVoltage - 3.0f) / 1.2f * 100.0f);
-  if (batPercent > 100) batPercent = 100;
-  if (batPercent < 0) batPercent = 0;
+// Composes into the shared frame — the caller is responsible for framePush().
+void drawTopBar() {
+  auto &gfx = frame();
+
+  gfx.drawFastHLine(0, 0, SCREEN_WIDTH, CYAN);
+  gfx.drawFastHLine(0, 1, SCREEN_WIDTH, CYAN);
+
+  gfx.setTextSize(1);
+  gfx.setCursor(4, 3);
+  gfx.setTextColor(paused ? RED : GREEN);
+  gfx.print(scanModeLabel());
+
+  // Reading only — the critical-battery shutdown lives in loop() now. It had no
+  // business running inside a render function, where it blocked on a 3-second
+  // delay while holding deviceMutex.
+  int batPercent = batteryPercent();
 
   int barWidth = 30;
   int barX = 75;
@@ -1126,18 +1377,18 @@ void drawTopBar() {
   if (batPercent < 50) barColor = YELLOW;
   if (batPercent < 25) barColor = RED;
 
-  M5.Display.setTextColor(BLUE_GREY);
-  M5.Display.setCursor(45, 3);
-  M5.Display.print("BATT:");
+  gfx.setTextColor(BLUE_GREY);
+  gfx.setCursor(45, 3);
+  gfx.print("BATT:");
 
-  M5.Display.drawRect(barX, barY, barWidth, 6, BLUE_GREY);
+  gfx.drawRect(barX, barY, barWidth, 6, BLUE_GREY);
   int filledWidth = (barWidth - 2) * batPercent / 100;
-  M5.Display.fillRect(barX + 1, barY + 1, filledWidth, 4, barColor);
+  gfx.fillRect(barX + 1, barY + 1, filledWidth, 4, barColor);
 
-  M5.Display.setTextColor(DARKGREY);
-  M5.Display.setCursor(110, 3);
-  M5.Display.print(batPercent);
-  M5.Display.print("%");
+  gfx.setTextColor(DARKGREY);
+  gfx.setCursor(110, 3);
+  gfx.print(batPercent);
+  gfx.print("%");
 
   uint32_t freeHeap = ESP.getFreeHeap();
   uint32_t freeKB = freeHeap / 1024;
@@ -1152,21 +1403,21 @@ void drawTopBar() {
   if (freeKB < MEMORY_WARNING) memColor = YELLOW;
   if (freeKB < MEMORY_CRITICAL) memColor = RED;
 
-  M5.Display.setCursor(135, 3);
-  M5.Display.setTextColor(BLUE_GREY);
-  M5.Display.print("MEM:");
+  gfx.setCursor(135, 3);
+  gfx.setTextColor(BLUE_GREY);
+  gfx.print("MEM:");
 
-  M5.Display.drawRect(barX, barY, barWidth, 6, BLUE_GREY);
+  gfx.drawRect(barX, barY, barWidth, 6, BLUE_GREY);
   filledWidth = (barWidth - 2) * memPercent / 100;
-  M5.Display.fillRect(barX + 1, barY + 1, filledWidth, 4, memColor);
+  gfx.fillRect(barX + 1, barY + 1, filledWidth, 4, memColor);
 
-  M5.Display.setTextColor(memColor);
-  M5.Display.setCursor(190, 3);
-  M5.Display.print(freeKB);
-  M5.Display.print("KB");
+  gfx.setTextColor(memColor);
+  gfx.setCursor(190, 3);
+  gfx.print(freeKB);
+  gfx.print("KB");
 
-  M5.Display.drawFastHLine(0, 11, SCREEN_WIDTH, CYAN);
-  M5.Display.drawFastHLine(0, 12, SCREEN_WIDTH, CYAN);
+  gfx.drawFastHLine(0, 11, SCREEN_WIDTH, CYAN);
+  gfx.drawFastHLine(0, 12, SCREEN_WIDTH, CYAN);
 }
 
 // Generate hashed display state
@@ -1177,20 +1428,27 @@ uint32_t getDisplayStateHash() {
   hash = hash * 31 + wifiDeviceIndex;
   hash = hash * 31 + scrollIndex;
   hash = hash * 31 + (isWifiView() ? 1 : 0);
+  hash = hash * 31 + (scanningWiFi ? 1 : 0);
   hash = hash * 31 + (paused ? 1 : 0);
   hash = hash * 31 + (uint32_t)filterMode;
+  hash = hash * 31 + (uint32_t)unackedAlertCount;
 
-  if (isWifiView()) {
+  // The merged alerts view renders rows from both arrays, so it has to watch
+  // both — hashing only one would leave the other's changes off screen.
+  if (isWifiView() || isMergedView()) {
     for (int i = 0; i < wifiDeviceIndex; i++) {
       hash = hash * 31 + (uint32_t)wifiDevices[i].rssi;
       hash = hash * 31 + wifiDevices[i].detectionCount;
       hash = hash * 31 + wifiDevices[i].channel;
       hash = hash * 31 + wifiDevices[i].encryptionType;
+      hash = hash * 31 + (wifiDevices[i].isSpecial ? 1 : 0);
       for (int j = 0; j < strlen(wifiDevices[i].ssid); j++) {
         hash = hash * 31 + wifiDevices[i].ssid[j];
       }
     }
-  } else {
+  }
+
+  if (!isWifiView()) {
     for (int i = 0; i < deviceIndex; i++) {
       hash = hash * 31 + trackedDevices[i].totalCount;
       hash = hash * 31 + (uint32_t)trackedDevices[i].lastRssi;
@@ -1211,19 +1469,535 @@ uint32_t getDisplayStateHash() {
 // Bottom strip of the findings screen: which filter is live, plus the two
 // gestures that aren't discoverable by mashing buttons. Tap actions are on the
 // controls screen (boot + settings menu) — there isn't room for all six here.
+// Composes into the shared frame — the caller is responsible for framePush().
 void drawListFooterHint() {
-  M5.Display.drawFastHLine(0, 133, SCREEN_WIDTH, CYAN);
-  M5.Display.drawFastHLine(0, 134, SCREEN_WIDTH, CYAN);
+  auto &gfx = frame();
 
-  M5.Display.setTextSize(1);
-  M5.Display.setTextColor(filterColor(filterMode));
-  M5.Display.setCursor(2, 124);
+  gfx.drawFastHLine(0, 133, SCREEN_WIDTH, CYAN);
+  gfx.drawFastHLine(0, 134, SCREEN_WIDTH, CYAN);
+
+  gfx.setTextSize(1);
+  gfx.setTextColor(filterColor(filterMode));
+  gfx.setCursor(2, 124);
   const char *tag = filterLabel(filterMode);
-  M5.Display.print(tag);
+  gfx.print(tag);
 
-  M5.Display.setTextColor(GREEN);
-  M5.Display.setCursor(2 + strlen(tag) * 6 + 8, 124);
-  M5.Display.print(paused ? "HOLD A:Scan B:Menu" : "HOLD A:Stop B:Menu");
+  gfx.setTextColor(GREEN);
+  const char *hints = paused ? "HOLD A:Scan B:Menu" : "HOLD A:Stop B:Menu";
+  gfx.setCursor(2 + strlen(tag) * 6 + 8, 124);
+  gfx.print(hints);
+
+  // An alert that timed out unacknowledged shouldn't disappear without trace.
+  // The whole screen edge goes red rather than a banner row taking a fourth of
+  // a 135px-tall screen: at this size the footer is already carrying the filter
+  // tag, both hold hints and the page counter, and the border was otherwise
+  // decorative. The count sits between the hints and the page counter, which is
+  // the one gap wide enough for it at every filter/page combination.
+  if (unackedAlertCount > 0) {
+    gfx.drawRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, RED);
+    gfx.drawRect(1, 1, SCREEN_WIDTH - 2, SCREEN_HEIGHT - 2, RED);
+
+    char badge[6];
+    snprintf(badge, sizeof(badge), "!%d", unackedAlertCount);
+    gfx.setTextColor(RED);
+    gfx.setCursor(2 + strlen(tag) * 6 + 8 + strlen(hints) * 6 + 6, 124);
+    gfx.print(badge);
+  }
+}
+
+// Takes an index rather than a DeviceInfo& deliberately: Arduino hoists its
+// generated prototypes above the struct definitions, so naming those types in a
+// signature breaks the build. RowSnapshot is declared at the top of the file for
+// the same reason.
+static void snapshotBleRow(RowSnapshot &r, int idx) {
+  const DeviceInfo &d = trackedDevices[idx];
+  r.isWifi = false;
+  r.detected = d.detected;
+  r.isSpecial = d.isSpecial;
+  strncpy(r.name, d.name, 32);
+  r.name[32] = '\0';
+  strncpy(r.address, d.address, 17);
+  r.address[17] = '\0';
+  strncpy(r.manufacturer, d.manufacturer, 30);
+  r.manufacturer[30] = '\0';
+  r.trackerType = d.trackerType;
+  r.score = d.persistenceScore;
+  r.firstSeen = d.firstSeen;
+  r.totalCount = d.totalCount;
+  r.rssi = d.lastRssi;
+  r.minRssi = d.minRssi;
+  r.maxRssi = d.maxRssi;
+  r.avgRssi = (d.rssiCount > 0) ? (d.rssiSum / d.rssiCount) : d.lastRssi;
+  r.channel = 0;
+  r.encryptionType = 0;
+}
+
+static void snapshotWifiRow(RowSnapshot &r, int idx) {
+  const WiFiDeviceInfo &w = wifiDevices[idx];
+  r.isWifi = true;
+  // A WiFi row is "detected" exactly when it's a privacy-invader OUI match —
+  // there's no persistence scoring on that band.
+  r.detected = w.isSpecial;
+  r.isSpecial = w.isSpecial;
+  strncpy(r.name, w.ssid, 32);
+  r.name[32] = '\0';
+  strncpy(r.address, w.bssid, 17);
+  r.address[17] = '\0';
+  getManufacturer(w.bssid, r.manufacturer, 31);
+  r.trackerType = w.isSpecial ? TRACKER_PRIVACY_INVADER : TRACKER_NONE;
+  r.score = 0.0f;
+  r.firstSeen = 0;
+  r.totalCount = w.detectionCount;
+  r.rssi = w.rssi;
+  r.minRssi = w.rssi;
+  r.maxRssi = w.rssi;
+  r.avgRssi = w.rssi;
+  r.channel = w.channel;
+  r.encryptionType = w.encryptionType;
+}
+
+// Stopping the scan switches from a three-row list to one device at a time,
+// with everything known about it. Every button is already assigned in both
+// modes, so there was no gesture left to open a detail view with — but stopping
+// already means "I want to look at this properly", and a frozen three-row list
+// is a weaker use of the screen than a full record of one device. Tap A still
+// steps through, so scrolling is unchanged; there's just one device per step.
+bool isDetailView() {
+  return paused;
+}
+
+// Collects the rows this frame will draw — three in list mode, one in the
+// paused detail view. MUST be called with deviceMutex held; touches nothing
+// but the device arrays and the snapshot.
+void buildFrameSnapshot(FrameSnapshot &s) {
+  const int maxDisplay = isDetailView() ? 1 : 3;
+
+  s.rowsFilled = 0;
+  s.totalItems = 0;
+  s.wifiView = isWifiView();
+  s.merged = isMergedView();
+  s.alertsOnly = mergedViewAlertsOnly();
+  s.bleTracked = deviceIndex;
+  s.wifiTracked = wifiDeviceIndex;
+  s.nothingTracked = (deviceIndex == 0 && wifiDeviceIndex == 0);
+
+  if (s.nothingTracked) {
+    s.scrollIndex = 0;
+    topVisibleValid = false;
+    return;
+  }
+
+  if (s.merged) {
+    // One list across both bands. "Alerts" that silently omitted every WiFi hit
+    // would be a trap now that a privacy-invader OUI can match a BSSID, and a
+    // paused browse needs to reach both lists since neither is being scanned.
+    // Definite hits (an OUI match on either band) sort above persistence-scored
+    // suspicions, then by score — certainty first, then confidence.
+    struct MergedRef { bool isWifi; int idx; float rank; };
+    MergedRef refs[MAX_DEVICES_CAP + MAX_WIFI_DEVICES_CAP];
+    int count = 0;
+
+    for (int i = 0; i < deviceIndex; i++) {
+      if (s.alertsOnly && !trackedDevices[i].detected) continue;
+      // The merged view still honours NAMED — pausing shouldn't quietly undo
+      // a filter the user set.
+      if (filterMode == FILTER_NAMED && strlen(trackedDevices[i].name) == 0) continue;
+      refs[count].isWifi = false;
+      refs[count].idx = i;
+      // Flagged devices outrank background ones, so a paused browse still puts
+      // anything alerting at the top rather than burying it mid-list.
+      refs[count].rank = trackedDevices[i].detected
+                             ? (trackedDevices[i].isSpecial ? 2.0f : 1.0f) +
+                                   trackedDevices[i].persistenceScore
+                             : -1.0f;
+      count++;
+    }
+    for (int i = 0; i < wifiDeviceIndex; i++) {
+      if (s.alertsOnly && !wifiDevices[i].isSpecial) continue;
+      if (filterMode == FILTER_NAMED && strlen(wifiDevices[i].ssid) == 0) continue;
+      refs[count].isWifi = true;
+      refs[count].idx = i;
+      refs[count].rank = wifiDevices[i].isSpecial ? 3.0f : -2.0f;
+      count++;
+    }
+
+    s.totalItems = count;
+    if (count == 0) {
+      s.scrollIndex = 0;
+      topVisibleValid = false;
+      return;
+    }
+
+    if (scrollIndex >= count) scrollIndex = 0;
+    s.scrollIndex = scrollIndex;
+
+    // Only the visible window needs ordering, so sort just that far. A full
+    // sort of every row, every frame, was wasted work inside the lock.
+    int needed = std::min(count, scrollIndex + maxDisplay);
+    std::partial_sort(refs, refs + needed, refs + count,
+                      [](const MergedRef &a, const MergedRef &b) {
+                        return a.rank > b.rank;
+                      });
+
+    // The allowlist menu action is BLE-only, so it only arms when the top row
+    // is a BLE device — otherwise it would appear to target the WiFi row on
+    // screen and then act on something else entirely.
+    if (!refs[scrollIndex].isWifi) {
+      strncpy(topVisibleAddress, trackedDevices[refs[scrollIndex].idx].address, 17);
+      topVisibleAddress[17] = '\0';
+      topVisibleValid = true;
+    } else {
+      topVisibleValid = false;
+    }
+
+    for (int r = scrollIndex; r < count && s.rowsFilled < maxDisplay; r++) {
+      if (refs[r].isWifi) {
+        snapshotWifiRow(s.rows[s.rowsFilled], refs[r].idx);
+      } else {
+        snapshotBleRow(s.rows[s.rowsFilled], refs[r].idx);
+      }
+      s.rowsFilled++;
+    }
+    return;
+  }
+
+  if (s.wifiView) {
+    // topVisibleAddress deliberately survives a WiFi frame: with no filter set
+    // the view alternates bands every few seconds, and clearing it here would
+    // make the menu's allowlist action available only half the time. The menu
+    // shows the MAC tail it would act on, so it's never a blind press.
+    s.totalItems = wifiDeviceIndex;
+    // APs ageing out can strand scrollIndex past the end of the shorter list.
+    if (scrollIndex >= wifiDeviceIndex) scrollIndex = 0;
+    s.scrollIndex = scrollIndex;
+
+    for (int i = scrollIndex; i < wifiDeviceIndex && s.rowsFilled < maxDisplay; i++) {
+      snapshotWifiRow(s.rows[s.rowsFilled], i);
+      s.rowsFilled++;
+    }
+    return;
+  }
+
+  // BLE list. FILTER_ALERTS never reaches here — it has its own merged branch.
+  int refs[MAX_DEVICES_CAP];
+  int count = 0;
+  for (int i = 0; i < deviceIndex; i++) {
+    if (filterMode == FILTER_NAMED && strlen(trackedDevices[i].name) == 0) continue;
+    refs[count++] = i;
+  }
+
+  s.totalItems = count;
+  if (count == 0) {
+    s.scrollIndex = 0;
+    topVisibleValid = false;
+    return;
+  }
+
+  // Devices ageing out from under a filter can strand scrollIndex past the
+  // end of the (now shorter) list.
+  if (scrollIndex >= count) scrollIndex = 0;
+  s.scrollIndex = scrollIndex;
+
+  int needed = std::min(count, scrollIndex + maxDisplay);
+  std::partial_sort(refs, refs + needed, refs + count, [](int a, int b) {
+    const DeviceInfo &x = trackedDevices[a];
+    const DeviceInfo &y = trackedDevices[b];
+    if (x.detected != y.detected) return x.detected;
+    if (x.detected) return x.persistenceScore > y.persistenceScore;
+    return x.totalCount > y.totalCount;
+  });
+
+  strncpy(topVisibleAddress, trackedDevices[refs[scrollIndex]].address, 17);
+  topVisibleAddress[17] = '\0';
+  topVisibleValid = true;
+
+  for (int i = scrollIndex; i < count && s.rowsFilled < maxDisplay; i++) {
+    snapshotBleRow(s.rows[s.rowsFilled], refs[i]);
+    s.rowsFilled++;
+  }
+}
+
+// Draws one row of the findings list at y, returning the y for the next row.
+// Reads only the snapshot — safe to call with no lock held.
+static int drawListRow(LovyanGFX &gfx, const RowSnapshot &r, int y,
+                       bool showBandTag, unsigned long nowSec) {
+  uint16_t nameColor;
+  if (r.isSpecial) {
+    nameColor = ORANGE;
+  } else if (r.isWifi) {
+    nameColor = WIFI_NAME_COLOR;
+  } else {
+    nameColor = r.detected ? RED : BLE_NAME_COLOR;
+  }
+
+  gfx.setTextColor(nameColor);
+  gfx.setTextSize(2);
+  gfx.setCursor(2, y);
+
+  char display[20];
+  if (strlen(r.name) > 0) {
+    strncpy(display, r.name, 16);
+    display[16] = '\0';
+    if (strlen(r.name) > 16) strcat(display, "...");
+  } else {
+    strcpy(display, r.isWifi ? "Hidden" : "Unknown");
+  }
+  gfx.print(display);
+  y += 17;
+
+  gfx.setTextSize(1);
+  gfx.setCursor(2, y);
+
+  int mfgBudget = 27;
+  if (showBandTag) {
+    gfx.setTextColor(nameColor);
+    gfx.print(r.isWifi ? "[WiFi] " : "[BLE] ");
+    mfgBudget -= 7;
+  }
+  if (!r.isWifi && r.trackerType != TRACKER_NONE) {
+    gfx.setTextColor(RED);
+    gfx.print("[");
+    gfx.print(trackerTypeName(r.trackerType));
+    gfx.print("] ");
+    mfgBudget -= (int)strlen(trackerTypeName(r.trackerType)) + 3;
+  }
+  gfx.setTextColor(YELLOW);
+  if (mfgBudget > 0) {
+    char mfg[31];
+    strncpy(mfg, r.manufacturer, std::min(mfgBudget, 30));
+    mfg[std::min(mfgBudget, 30)] = '\0';
+    gfx.print(mfg);
+  }
+  y += 9;
+
+  gfx.setCursor(2, y);
+  if (!r.isWifi && r.detected) {
+    gfx.setTextColor(RED);
+    gfx.print("!");
+    gfx.setTextColor(YELLOW);
+    gfx.print(r.score, 2);
+    char durStr[10];
+    unsigned long elapsed = (nowSec >= r.firstSeen) ? (nowSec - r.firstSeen) : 0;
+    formatDuration(elapsed, durStr, sizeof(durStr));
+    gfx.setTextColor(WHITE);
+    gfx.print(" ");
+    gfx.print(durStr);
+  } else if (r.isWifi) {
+    gfx.setTextColor(WHITE);
+    gfx.printf("Ch%d ", r.channel);
+    // The band-tagged merged view spends this line's remaining width on the
+    // BSSID instead: on a row that's alerting, which device it is matters more
+    // than how the AP is encrypted.
+    if (!showBandTag) {
+      gfx.setTextColor(GREEN);
+      gfx.print(wifiAuthName(r.encryptionType));
+      gfx.print(" ");
+    }
+    gfx.setTextColor(DARKGREY);
+    gfx.print(r.totalCount);
+    gfx.print("x ");
+    if (showSignalBars) {
+      drawSignalBars(gfx, gfx.getCursorX(), y, r.rssi, DARKGREY);
+    } else {
+      gfx.print(r.rssi);
+      gfx.print("dB");
+    }
+  } else {
+    gfx.setTextColor(WHITE);
+    gfx.print(r.totalCount);
+    gfx.print("x ");
+    if (showSignalBars) {
+      drawSignalBars(gfx, gfx.getCursorX(), y, r.rssi, WHITE);
+    } else {
+      gfx.print(r.rssi);
+      gfx.print("dB");
+    }
+  }
+
+  // The un-merged WiFi list spends this space on the encryption type instead,
+  // which is the one view where the BSSID isn't the point.
+  if (!r.isWifi || showBandTag) {
+    gfx.setCursor(80, y);
+    gfx.setTextColor(BLUE_GREY);
+    gfx.print(r.address);
+  }
+
+  return y + 11;
+}
+
+// One device, everything known about it. Shown while stopped — see
+// isDetailView(). Reads only the snapshot, so no lock is held.
+static void drawDetailView(LovyanGFX &gfx, const RowSnapshot &r,
+                           unsigned long nowSec) {
+  int y = 16;
+
+  uint16_t headColor = r.isSpecial ? ORANGE
+                       : r.detected ? RED
+                                    : (r.isWifi ? WIFI_NAME_COLOR : BLE_NAME_COLOR);
+
+  gfx.setTextSize(2);
+  gfx.setTextColor(headColor);
+  gfx.setCursor(2, y);
+  char nameDisplay[21];
+  if (strlen(r.name) > 0) {
+    strncpy(nameDisplay, r.name, 17);
+    nameDisplay[17] = '\0';
+    if (strlen(r.name) > 17) strcat(nameDisplay, "...");
+  } else {
+    strcpy(nameDisplay, r.isWifi ? "Hidden SSID" : "Unnamed");
+  }
+  gfx.print(nameDisplay);
+  y += 19;
+
+  gfx.setTextSize(1);
+
+  // Full address, untruncated — this is the view you read a MAC off to write
+  // it down, so it gets its own line at full width.
+  gfx.setTextColor(WHITE);
+  gfx.setCursor(2, y);
+  gfx.print(r.isWifi ? "BSSID " : "MAC   ");
+  gfx.setTextColor(BLUE_GREY);
+  gfx.print(r.address);
+  y += 10;
+
+  gfx.setTextColor(WHITE);
+  gfx.setCursor(2, y);
+  gfx.print("Vendor ");
+  gfx.setTextColor(YELLOW);
+  char mfg[28];
+  strncpy(mfg, r.manufacturer, 27);
+  mfg[27] = '\0';
+  gfx.print(mfg);
+  y += 10;
+
+  gfx.setTextColor(WHITE);
+  gfx.setCursor(2, y);
+  if (r.isWifi) {
+    gfx.printf("WiFi   Ch%d  ", r.channel);
+    gfx.setTextColor(GREEN);
+    gfx.print(wifiAuthName(r.encryptionType));
+  } else if (r.trackerType != TRACKER_NONE) {
+    gfx.print("Type   ");
+    gfx.setTextColor(RED);
+    gfx.print(trackerTypeName(r.trackerType));
+  } else {
+    gfx.print("Type   ");
+    gfx.setTextColor(DARKGREY);
+    gfx.print("Unclassified BLE");
+  }
+  y += 10;
+
+  // Signal as range, not a single reading: a device holding steady while you
+  // move is the interesting case, and one number can't show that.
+  gfx.setTextColor(WHITE);
+  gfx.setCursor(2, y);
+  gfx.print("Signal ");
+  if (showSignalBars) {
+    drawSignalBars(gfx, gfx.getCursorX(), y, r.rssi, WHITE);
+    gfx.setCursor(gfx.getCursorX() + 24, y);
+  }
+  gfx.setTextColor(DARKGREY);
+  gfx.printf("%d now", r.rssi);
+  if (!r.isWifi && r.minRssi != r.maxRssi) {
+    gfx.printf(" (%d..%d avg %d)", r.minRssi, r.maxRssi, r.avgRssi);
+  }
+  y += 10;
+
+  gfx.setTextColor(WHITE);
+  gfx.setCursor(2, y);
+  gfx.printf("Seen   %dx", r.totalCount);
+  if (!r.isWifi) {
+    char durStr[10];
+    unsigned long elapsed = (nowSec >= r.firstSeen) ? (nowSec - r.firstSeen) : 0;
+    formatDuration(elapsed, durStr, sizeof(durStr));
+    gfx.printf(" over %s", durStr);
+  }
+  y += 10;
+
+  gfx.setTextColor(WHITE);
+  gfx.setCursor(2, y);
+  gfx.print("Score  ");
+  if (r.isWifi) {
+    gfx.setTextColor(r.isSpecial ? ORANGE : DARKGREY);
+    gfx.print(r.isSpecial ? "OUI match (immediate)" : "not scored on WiFi");
+  } else {
+    gfx.setTextColor(r.detected ? RED : DARKGREY);
+    gfx.printf("%.2f", r.score);
+    gfx.setTextColor(DARKGREY);
+    gfx.printf(" / %.2f to alert", persistenceThreshold);
+  }
+}
+
+// Renders a prepared snapshot. No lock held — see displayTrackedDevices().
+void renderFrameSnapshot(const FrameSnapshot &s, unsigned long nowSec) {
+  auto &gfx = frame();
+
+  gfx.fillScreen(BLACK);
+  drawTopBar();
+
+  if (s.nothingTracked) {
+    lastVisibleItemCount = 0;
+    gfx.setTextSize(2);
+    gfx.setTextColor(DARKGREY);
+    gfx.setCursor(55, 60);
+    gfx.print(paused ? "Stopped" : "Scanning...");
+    drawListFooterHint();
+    framePush();
+    return;
+  }
+
+  // A filter that matches nothing yet should say so, not leave a blank screen
+  // that looks like the device stopped working.
+  if (s.totalItems == 0) {
+    lastVisibleItemCount = 0;
+    gfx.setTextSize(2);
+    gfx.setTextColor(filterColor(filterMode));
+    gfx.setCursor(2, 45);
+    gfx.print(s.alertsOnly                  ? "No alerts"
+              : filterMode == FILTER_NAMED  ? "No named"
+                                            : "Nothing yet");
+    gfx.setTextSize(1);
+    gfx.setTextColor(DARKGREY);
+    gfx.setCursor(2, 70);
+    if (s.alertsOnly) {
+      gfx.printf("%d BLE / %d WiFi tracked, none flagged", s.bleTracked,
+                 s.wifiTracked);
+    } else {
+      gfx.printf("%d BLE / %d WiFi tracked, none match", s.bleTracked,
+                 s.wifiTracked);
+    }
+    drawListFooterHint();
+    framePush();
+    return;
+  }
+
+  if (isDetailView() && s.rowsFilled > 0) {
+    drawDetailView(gfx, s.rows[0], nowSec);
+  } else {
+    int y = 15;
+    for (int i = 0; i < s.rowsFilled; i++) {
+      if (i > 0) {
+        gfx.drawFastHLine(0, y - 2, SCREEN_WIDTH, BLUE_GREY);
+        y += 1;
+      }
+      y = drawListRow(gfx, s.rows[i], y, s.merged, nowSec);
+    }
+  }
+
+  lastVisibleItemCount = s.totalItems;
+
+  drawListFooterHint();
+
+  gfx.setTextSize(1);
+  gfx.setTextColor(YELLOW);
+  char countStr[20];
+  snprintf(countStr, sizeof(countStr), "%d-%d/%d", s.scrollIndex + 1,
+           s.scrollIndex + s.rowsFilled, s.totalItems);
+  int xPos = SCREEN_WIDTH - (int)strlen(countStr) * 6 - 4;
+  gfx.setCursor(xPos, 124);
+  gfx.print(countStr);
+
+  framePush();
 }
 
 void displayTrackedDevices() {
@@ -1243,271 +2017,21 @@ void displayTrackedDevices() {
     return;
   }
 
-  // Actually have data to change, go on
   lastStateHash = currentHash;
   lastDisplayRender = now;
-
   displayingWifiView = isWifiView();
 
-  M5.Display.fillScreen(BLACK);
-  drawTopBar();
-
-  // Show scanning message when no devices found yet
-  if (deviceIndex == 0 && wifiDeviceIndex == 0) {
-    lastVisibleItemCount = 0;
-    M5.Display.setTextSize(2);
-    M5.Display.setTextColor(DARKGREY);
-    M5.Display.setCursor(55, 60);
-    M5.Display.print(paused ? "Stopped" : "Scanning...");
-    drawListFooterHint();
-    xSemaphoreGive(deviceMutex);
-    return;
-  }
-
-  int y = 15;
-  int displayed = 0;
-  const int maxDisplay = 3;
-  int totalItems = 0;
-
-  if (displayingWifiView) {
-    // topVisibleAddress deliberately survives a WiFi frame: with no filter set
-    // the view alternates bands every few seconds, and clearing it here would
-    // make the menu's allowlist action available only half the time. The menu
-    // shows the MAC tail it would act on, so it's never a blind press.
-
-    totalItems = wifiDeviceIndex;
-    // APs ageing out can strand scrollIndex past the end of the shorter list.
-    if (scrollIndex >= wifiDeviceIndex) scrollIndex = 0;
-
-    for (int i = scrollIndex; i < wifiDeviceIndex && displayed < maxDisplay;
-         i++, displayed++) {
-      if (displayed > 0) {
-        M5.Display.drawFastHLine(0, y - 2, SCREEN_WIDTH, BLUE_GREY);
-        y += 1;
-      }
-
-      M5.Display.setTextColor(WIFI_NAME_COLOR);
-      M5.Display.setTextSize(2);
-      M5.Display.setCursor(2, y);
-      char ssidDisplay[20];
-      if (strlen(wifiDevices[i].ssid) > 0) {
-        strncpy(ssidDisplay, wifiDevices[i].ssid, 16);
-        ssidDisplay[16] = '\0';
-        if (strlen(wifiDevices[i].ssid) > 16) strcat(ssidDisplay, "...");
-      } else {
-        strcpy(ssidDisplay, "Hidden");
-      }
-      M5.Display.print(ssidDisplay);
-      y += 17;
-
-      M5.Display.setTextSize(1);
-      M5.Display.setCursor(2, y);
-      M5.Display.setTextColor(YELLOW);
-      char mfgDisplay[28];
-      getManufacturer(wifiDevices[i].bssid, mfgDisplay, 28);
-      M5.Display.print(mfgDisplay);
-      y += 9;
-
-      M5.Display.setTextSize(1);
-      M5.Display.setCursor(2, y);
-      M5.Display.setTextColor(WHITE);
-      M5.Display.print("Ch");
-      M5.Display.print(wifiDevices[i].channel);
-      M5.Display.print(" ");
-      M5.Display.setTextColor(GREEN);
-      switch (wifiDevices[i].encryptionType) {
-        case WIFI_AUTH_OPEN: M5.Display.print("OPEN"); break;
-        case WIFI_AUTH_WEP: M5.Display.print("WEP"); break;
-        case WIFI_AUTH_WPA_PSK: M5.Display.print("WPA"); break;
-        case WIFI_AUTH_WPA2_PSK: M5.Display.print("WPA2"); break;
-        case WIFI_AUTH_WPA_WPA2_PSK: M5.Display.print("WPA/2"); break;
-        case WIFI_AUTH_WPA2_ENTERPRISE: M5.Display.print("WPA2-E"); break;
-        case WIFI_AUTH_WPA3_PSK: M5.Display.print("WPA3"); break;
-        case WIFI_AUTH_WPA2_WPA3_PSK: M5.Display.print("WPA2/3"); break;
-        case WIFI_AUTH_WAPI_PSK: M5.Display.print("WAPI"); break;
-        case WIFI_AUTH_OWE: M5.Display.print("OWE"); break;
-        case WIFI_AUTH_WPA3_ENT_192: M5.Display.print("WPA3-E"); break;
-        default: M5.Display.print("UNK"); break;
-      }
-      M5.Display.print(" ");
-      M5.Display.setTextColor(DARKGREY);
-      M5.Display.print(wifiDevices[i].detectionCount);
-      M5.Display.print("x ");
-      M5.Display.print(wifiDevices[i].rssi);
-      M5.Display.print("dB");
-      y += 11;
-    }
-  } else {
-    int filteredCount = 0;
-    int sortedIndices[MAX_DEVICES_CAP];
-
-    for (int i = 0; i < deviceIndex; i++) {
-      if (filterMode == FILTER_NAMED && strlen(trackedDevices[i].name) == 0) continue;
-      if (filterMode == FILTER_ALERTS && !trackedDevices[i].detected) continue;
-      sortedIndices[filteredCount++] = i;
-    }
-
-    for (int i = 0; i < filteredCount - 1; i++) {
-      for (int j = i + 1; j < filteredCount; j++) {
-        bool swap = false;
-        if (trackedDevices[sortedIndices[i]].detected &&
-            trackedDevices[sortedIndices[j]].detected) {
-          swap = trackedDevices[sortedIndices[i]].persistenceScore <
-                 trackedDevices[sortedIndices[j]].persistenceScore;
-        } else if (!trackedDevices[sortedIndices[i]].detected &&
-                   trackedDevices[sortedIndices[j]].detected) {
-          swap = true;
-        } else if (!trackedDevices[sortedIndices[i]].detected &&
-                   !trackedDevices[sortedIndices[j]].detected) {
-          swap = trackedDevices[sortedIndices[i]].totalCount <
-                 trackedDevices[sortedIndices[j]].totalCount;
-        }
-        if (swap) {
-          int temp = sortedIndices[i];
-          sortedIndices[i] = sortedIndices[j];
-          sortedIndices[j] = temp;
-        }
-      }
-    }
-
-    totalItems = filteredCount;
-
-    // A filter that matches nothing yet should say so, not leave a blank
-    // screen that looks like the device stopped working.
-    if (filteredCount == 0) {
-      lastVisibleItemCount = 0;
-      topVisibleValid = false;
-      M5.Display.setTextSize(2);
-      M5.Display.setTextColor(filterColor(filterMode));
-      M5.Display.setCursor(2, 45);
-      M5.Display.print(filterMode == FILTER_ALERTS ? "No alerts" : "No named");
-      M5.Display.setTextSize(1);
-      M5.Display.setTextColor(DARKGREY);
-      M5.Display.setCursor(2, 70);
-      M5.Display.print(deviceIndex);
-      M5.Display.print(" BLE device(s) tracked, none match");
-      drawListFooterHint();
-      xSemaphoreGive(deviceMutex);
-      return;
-    }
-
-    // Devices ageing out from under a filter can strand scrollIndex past the
-    // end of the (now shorter) list.
-    if (scrollIndex >= filteredCount) scrollIndex = 0;
-
-    if (scrollIndex < filteredCount) {
-      strncpy(topVisibleAddress, trackedDevices[sortedIndices[scrollIndex]].address, 17);
-      topVisibleAddress[17] = '\0';
-      topVisibleValid = true;
-    } else {
-      topVisibleValid = false;
-    }
-
-    for (int idx = scrollIndex; idx < filteredCount && displayed < maxDisplay;
-         idx++, displayed++) {
-      int i = sortedIndices[idx];
-
-      if (displayed > 0) {
-        M5.Display.drawFastHLine(0, y - 2, SCREEN_WIDTH, BLUE_GREY);
-        y += 1;
-      }
-
-      if (trackedDevices[i].isSpecial) {
-        M5.Display.setTextColor(ORANGE);
-      } else if (trackedDevices[i].detected) {
-        M5.Display.setTextColor(RED);
-      } else {
-         M5.Display.setTextColor(BLE_NAME_COLOR);
-      }
-
-      M5.Display.setTextSize(2);
-      M5.Display.setCursor(2, y);
-
-      char nameDisplay[20];
-      if (strlen(trackedDevices[i].name) > 0) {
-        strncpy(nameDisplay, trackedDevices[i].name, 16);
-        nameDisplay[16] = '\0';
-        if (strlen(trackedDevices[i].name) > 16) strcat(nameDisplay, "...");
-      } else {
-        strcpy(nameDisplay, "Unknown");
-      }
-      M5.Display.print(nameDisplay);
-      y += 17;
-
-      M5.Display.setTextSize(1);
-      M5.Display.setCursor(2, y);
-
-      // Show tracker type badge if identified, otherwise manufacturer
-      if (trackedDevices[i].trackerType != TRACKER_NONE) {
-        M5.Display.setTextColor(RED);
-        M5.Display.print("[");
-        M5.Display.print(trackerTypeName(trackedDevices[i].trackerType));
-        M5.Display.print("] ");
-        M5.Display.setTextColor(YELLOW);
-        char mfgShort[16];
-        strncpy(mfgShort, trackedDevices[i].manufacturer, 15);
-        mfgShort[15] = '\0';
-        M5.Display.print(mfgShort);
-      } else {
-        M5.Display.setTextColor(YELLOW);
-        char mfgDisplay[28];
-        strncpy(mfgDisplay, trackedDevices[i].manufacturer, 27);
-        mfgDisplay[27] = '\0';
-        M5.Display.print(mfgDisplay);
-      }
-      y += 9;
-
-      M5.Display.setTextSize(1);
-      M5.Display.setCursor(2, y);
-
-      if (trackedDevices[i].detected) {
-        M5.Display.setTextColor(RED);
-        M5.Display.print("!");
-        M5.Display.setTextColor(YELLOW);
-        M5.Display.print(trackedDevices[i].persistenceScore, 2);
-        char durStr[10];
-        unsigned long nowSec = now / 1000;
-        unsigned long elapsed = (nowSec >= trackedDevices[i].firstSeen)
-                                     ? (nowSec - trackedDevices[i].firstSeen) : 0;
-        formatDuration(elapsed, durStr, sizeof(durStr));
-        M5.Display.setTextColor(WHITE);
-        M5.Display.print(" ");
-        M5.Display.print(durStr);
-      } else {
-        M5.Display.setTextColor(WHITE);
-        M5.Display.print(trackedDevices[i].totalCount);
-        M5.Display.print("x ");
-        M5.Display.print(trackedDevices[i].lastRssi);
-        M5.Display.print("dB");
-      }
-
-      M5.Display.setCursor(80, y);
-      M5.Display.setTextColor(BLUE_GREY);
-      M5.Display.print(trackedDevices[i].address);
-      y += 11;
-    }
-  }
-
-  lastVisibleItemCount = totalItems;
-
-  drawListFooterHint();
-
-  if (totalItems > 0) {
-    M5.Display.setTextSize(1);
-    M5.Display.setTextColor(YELLOW);
-
-    char countStr[20];
-    int showing = std::min(maxDisplay, totalItems - scrollIndex);
-    snprintf(countStr, sizeof(countStr), "%d-%d/%d", scrollIndex + 1,
-             scrollIndex + showing, totalItems);
-
-    int textWidth = strlen(countStr) * 6;
-    int xPos = SCREEN_WIDTH - textWidth - 4;
-    M5.Display.setCursor(xPos, 124);
-    M5.Display.print(countStr);
-  }
+  // Copy out what this frame needs, then get off the lock before drawing any
+  // of it. The draw used to run start to finish with deviceMutex held —
+  // including every SPI write to the panel — while scanTask on Core 0 needs
+  // that same mutex to record what it just scanned and gives up after 2000ms.
+  // A slow frame could therefore make an entire scan batch get discarded.
+  static FrameSnapshot snapshot;
+  buildFrameSnapshot(snapshot);
 
   xSemaphoreGive(deviceMutex);
+
+  renderFrameSnapshot(snapshot, now / 1000);
 }
 
 void displayMenuScreen() {
@@ -1518,57 +2042,47 @@ void displayMenuScreen() {
   }
   lastMenuRender = now;
 
-  M5.Display.fillScreen(BLACK);
-  M5.Display.setCursor(2, 2);
-  M5.Display.setTextColor(GREEN);
-  M5.Display.setTextSize(1);
-  M5.Display.print("SETTINGS");
+  auto &gfx = frame();
+
+  gfx.fillScreen(BLACK);
+  gfx.setCursor(2, 2);
+  gfx.setTextColor(GREEN);
+  gfx.setTextSize(1);
+  gfx.print("SETTINGS");
 
   // The splash flashes past in a couple of seconds; this is the version you
   // can go and look up at any time to confirm what's actually flashed.
-  M5.Display.setTextColor(DARKGREY);
-  M5.Display.setCursor(SCREEN_WIDTH - 4 - (int)(strlen(FIRMWARE_VERSION) + 1) * 6, 2);
-  M5.Display.print("v" FIRMWARE_VERSION);
+  gfx.setTextColor(DARKGREY);
+  gfx.setCursor(SCREEN_WIDTH - 4 - (int)(strlen(FIRMWARE_VERSION) + 1) * 6, 2);
+  gfx.print("v" FIRMWARE_VERSION);
 
-  M5.Display.drawLine(0, 12, SCREEN_WIDTH, 12, DARKGREY);
+  gfx.drawLine(0, 12, SCREEN_WIDTH, 12, DARKGREY);
 
   int y = 15;
 
-  M5.Display.setTextColor(WHITE);
-  M5.Display.setCursor(2, y);
+  gfx.setTextColor(WHITE);
+  gfx.setCursor(2, y);
 
-  static float lastValidBatVoltage = 3.7f;
-  float batVoltage = M5.Power.getBatteryVoltage() / 1000.0f;
-
-  // Filter out obviously bad readings (sensor errors), but allow real low battery
-  if (batVoltage > 2.0f && batVoltage < 4.5f) {
-    lastValidBatVoltage = batVoltage;
-  } else {
-    batVoltage = lastValidBatVoltage;
-  }
-
-  int batPercent = (int)((batVoltage - 3.0f) / 1.2f * 100.0f);
-  if (batPercent > 100) batPercent = 100;
-  if (batPercent < 0) batPercent = 0;
+  int batPercent = batteryPercent();
   float estHoursRemaining = (batPercent / 100.0f) * TYPICAL_BATTERY_LIFE_HOURS;
-  // Everything status-y on one line — nine menu rows need the vertical space.
-  M5.Display.print("Bat:");
-  M5.Display.print(batPercent);
-  M5.Display.print("% ~");
+  // Everything status-y on one line — ten menu rows need the vertical space.
+  gfx.print("Bat:");
+  gfx.print(batPercent);
+  gfx.print("% ~");
   if (estHoursRemaining >= 1.0f) {
-    M5.Display.print(estHoursRemaining, 1);
-    M5.Display.print("h");
+    gfx.print(estHoursRemaining, 1);
+    gfx.print("h");
   } else {
-    M5.Display.print((int)(estHoursRemaining * 60));
-    M5.Display.print("m");
+    gfx.print((int)(estHoursRemaining * 60));
+    gfx.print("m");
   }
-  M5.Display.print(" RAM:");
-  M5.Display.print(ESP.getFreeHeap() / 1024);
-  M5.Display.print("K Trk:");
-  M5.Display.print(deviceIndex);
+  gfx.print(" RAM:");
+  gfx.print(ESP.getFreeHeap() / 1024);
+  gfx.print("K Trk:");
+  gfx.print(deviceIndex);
   y += 11;
 
-  M5.Display.drawLine(0, y, SCREEN_WIDTH, y, DARKGREY);
+  gfx.drawLine(0, y, SCREEN_WIDTH, y, DARKGREY);
   y += 3;
 
   menuBaseY = y;
@@ -1588,48 +2102,59 @@ void displayMenuScreen() {
   // a list of verbs whose effect you only learn by pressing them.
   const char *labels[MENU_OPTION_COUNT] = {
     "Alert Style",  "Alert Sound",     "Brightness",    "Screen Timeout",
-    "Allowlist Top Device", "Export Incident", "Clear Devices",
-    "Show Controls", "Shutdown"
+    "Signal Display", "Allowlist Top Device", "Export Incident",
+    "Clear Devices", "Show Controls", "Shutdown"
   };
   const char *values[MENU_OPTION_COUNT] = {
     alertStyleName(alertStyle),
     alertSoundEnabled ? "ON" : "OFF",
     highBrightness ? "HIGH" : "LOW",
     timeoutStr,
+    showSignalBars ? "BARS" : "dBm",
     allowTarget,
     "", "", "", ""
   };
 
+  // Inverse video for the selected row rather than a ">" in the margin — at
+  // this size a single caret is easy to lose, and the highlight reads as
+  // "you are here" from across a room.
   for (int i = 0; i < MENU_OPTION_COUNT; i++) {
-    M5.Display.setTextColor(CYAN);
-    M5.Display.setCursor(10, y);
-    M5.Display.print(labels[i]);
+    bool selected = (i == menuIndex);
+
+    if (selected) {
+      gfx.fillRect(0, y - 1, SCREEN_WIDTH, MENU_ROW_H, CYAN);
+    }
+
+    gfx.setTextColor(selected ? BLACK : CYAN);
+    gfx.setCursor(4, y);
+    gfx.print(labels[i]);
     if (strlen(values[i]) > 0) {
-      M5.Display.setTextColor(WHITE);
-      M5.Display.setCursor(SCREEN_WIDTH - 4 - (int)(strlen(values[i]) * 6), y);
-      M5.Display.print(values[i]);
+      gfx.setTextColor(selected ? BLACK : WHITE);
+      gfx.setCursor(SCREEN_WIDTH - 4 - (int)(strlen(values[i]) * 6), y);
+      gfx.print(values[i]);
     }
     y += MENU_ROW_H;
   }
 
-  M5.Display.drawLine(0, y, SCREEN_WIDTH, y, DARKGREY);
+  gfx.drawLine(0, y, SCREEN_WIDTH, y, DARKGREY);
 
-  M5.Display.setTextColor(YELLOW);
-  M5.Display.setTextSize(1);
-  M5.Display.setCursor(2, y + 3);
-  M5.Display.print("A:Next  B:Select  HOLD B:Close");
+  gfx.setTextColor(YELLOW);
+  gfx.setTextSize(1);
+  gfx.setCursor(2, y + 3);
+  gfx.print("A:Next  B:Select  HOLD B:Close");
+
+  framePush();
 }
 
+// Buffered rendering has no cheap partial update to offer: the frame is rebuilt
+// and pushed whole either way, which is still fewer SPI transfers than the old
+// per-field repaint this replaces. So moving the selection just forces that
+// rebuild immediately instead of waiting out displayMenuScreen()'s throttle,
+// which is what keeps menu nav feeling instant.
 void highlightMenuOption(int index) {
-  for (int i = 0; i < MENU_OPTION_COUNT; i++) {
-    M5.Display.setCursor(2, menuBaseY + (i * MENU_ROW_H));
-    M5.Display.setTextColor(BLACK);
-    M5.Display.print(">");
-  }
-
-  M5.Display.setCursor(2, menuBaseY + (index * MENU_ROW_H));
-  M5.Display.setTextColor(YELLOW);
-  M5.Display.print(">");
+  menuIndex = index;
+  lastMenuRender = 0;
+  displayMenuScreen();
 }
 
 void saveUserPreferences() {
@@ -1646,6 +2171,8 @@ void saveUserPreferences() {
   file.println((int)alertStyle);
   file.print("sound=");
   file.println(alertSoundEnabled ? "1" : "0");
+  file.print("signalbars=");
+  file.println(showSignalBars ? "1" : "0");
   file.print("persistThresh=");
   file.println(persistenceThreshold, 2);
   file.print("rssiStable=");
@@ -1684,6 +2211,8 @@ void loadUserPreferences() {
       }
     } else if (line.startsWith("sound=")) {
       alertSoundEnabled = line.substring(6).toInt() == 1;
+    } else if (line.startsWith("signalbars=")) {
+      showSignalBars = line.substring(11).toInt() == 1;
     } else if (line.startsWith("persistThresh=")) {
       float v = line.substring(14).toFloat();
       if (v >= 0.0f && v <= 1.0f) persistenceThreshold = v;
@@ -1740,7 +2269,11 @@ bool removeFromAllowlist(const char *address) {
 
   bool found = false;
   for (int i = 0; i < runtimeAllowlistCount; i++) {
-    if (strcmp(runtimeAllowlist[i], address) == 0) {
+    // Case-insensitive to match isAllowlistedMac(). The menu action stores the
+    // lowercase address BLE reports, while the README documents `allow remove`
+    // with an uppercase MAC — comparing exactly would leave an entry that can
+    // be matched against but never removed.
+    if (strcasecmp(runtimeAllowlist[i], address) == 0) {
       for (int j = i; j < runtimeAllowlistCount - 1; j++) {
         strcpy(runtimeAllowlist[j], runtimeAllowlist[j + 1]);
       }
@@ -1911,6 +2444,29 @@ int exportIncident() {
     file.println(trackedDevices[i].totalCount);
     count++;
   }
+
+  // WiFi privacy-invader hits belong in the same snapshot — an export that
+  // silently dropped them would misrepresent what the device actually saw.
+  for (int i = 0; i < wifiDeviceIndex; i++) {
+    if (!wifiDevices[i].isSpecial) continue;
+    char mfg[31];
+    getManufacturer(wifiDevices[i].bssid, mfg, sizeof(mfg));
+    file.print(wifiDevices[i].bssid);
+    file.print(",");
+    file.print(strlen(wifiDevices[i].ssid) > 0 ? wifiDevices[i].ssid : "(hidden SSID)");
+    file.print(",");
+    file.print(mfg);
+    file.print(",");
+    file.print(trackerTypeName(TRACKER_PRIVACY_INVADER));
+    file.print(",band=wifi,channel=");
+    file.print(wifiDevices[i].channel);
+    file.print(",rssi=");
+    file.print(wifiDevices[i].rssi);
+    file.print(",totalCount=");
+    file.println(wifiDevices[i].detectionCount);
+    count++;
+  }
+
   if (count == 0) {
     file.println("(no currently-alerting devices)");
   }
@@ -1926,8 +2482,14 @@ void clearDevices() {
   }
 
   deviceIndex = 0;
+  // The WiFi list goes too. Alerting entries are deliberately pinned against
+  // expiry now, so leaving them here would make "Clear Devices" visibly not
+  // clear the rows most worth clearing.
+  wifiDeviceIndex = 0;
+  knownDeviceCount = 0;
   scrollIndex = 0;
   topVisibleValid = false;
+  unackedAlertCount = 0;
 
   xSemaphoreGive(deviceMutex);
 }
@@ -2130,6 +2692,7 @@ void printSerialConfig() {
   Serial.printf("  alert style     = %s  (LOUD strobes, SIMPLE fills, QUIET borders)\n",
                 alertStyleName(alertStyle));
   Serial.printf("  alert sound     = %s\n", alertSoundEnabled ? "ON" : "OFF");
+  Serial.printf("  signal display  = %s\n", showSignalBars ? "BARS" : "dBm");
   handleSpecialCommand("list", NULL);
   handleAllowCommand("list", NULL);
   handleThresholdCommand("list", NULL, NULL);
@@ -2197,9 +2760,12 @@ void executeMenuOption(int index) {
       cycleScreenTimeout();
       break;
     case 4:
+      toggleSignalDisplay();
+      break;
+    case 5:
       allowlistTopDevice();
       break;
-    case 5: {
+    case 6: {
       int exported = exportIncident();
       char msg[16];
       snprintf(msg, sizeof(msg), "%d EXPORTED", exported);
@@ -2207,22 +2773,21 @@ void executeMenuOption(int index) {
       delay(1000);
       break;
     }
-    case 6:
+    case 7:
       clearDevices();
       showFeedback("CLEARED", GREEN);
       delay(1000);
       break;
-    case 7:
+    case 8:
       showControlsScreen(0);
       break;
-    case 8:
+    case 9:
       shutdownDevice();
       return;
   }
 
   forceDisplayRefresh();
   displayMenuScreen();
-  highlightMenuOption(menuIndex);
 }
 
 void cycleScreenTimeout() {
@@ -2261,6 +2826,14 @@ void cycleAlertStyle() {
                : alertStyle == ALERT_LOUD ? "Red/blue strobe"
                                           : "Solid screen, no flashing");
   delay(1200);
+}
+
+void toggleSignalDisplay() {
+  showSignalBars = !showSignalBars;
+  saveUserPreferences();
+  showFeedback(showSignalBars ? "BARS" : "dBm", CYAN,
+               showSignalBars ? "Signal as 4-bar glyph" : "Signal as raw dBm");
+  delay(1000);
 }
 
 void toggleAlertSound() {
@@ -2322,7 +2895,7 @@ void setPaused(bool wantPaused) {
   paused = wantPaused;
   scrollIndex = 0;
   showFeedback(paused ? "STOPPED" : "SCANNING", paused ? RED : GREEN,
-               paused ? "Hold A to scan again" : NULL);
+               paused ? "Device detail - A steps through" : NULL);
   delay(900);
   refreshList();
 }
@@ -2333,7 +2906,6 @@ void openMenu() {
   lastActivityTime = millis();
   forceDisplayRefresh();
   displayMenuScreen();
-  highlightMenuOption(menuIndex);
 }
 
 void closeMenu() {
@@ -2344,6 +2916,13 @@ void closeMenu() {
 
 void cycleFilter() {
   filterMode = (FilterMode)((filterMode + 1) % 3);
+
+  // Looking at the alerts is the acknowledgement — the red border and its count
+  // have done their job once the user is on the screen that lists what fired.
+  if (filterMode == FILTER_ALERTS) {
+    unackedAlertCount = 0;
+  }
+
   // Row counts differ per filter; keeping the old offset would drop the user
   // into the middle of a list they didn't scroll.
   scrollIndex = 0;
@@ -2352,18 +2931,22 @@ void cycleFilter() {
                      : filterMode == FILTER_ALERTS ? "ALERTS"
                      : "ALL";
   showFeedback(label, filterColor(filterMode),
-               filterMode == FILTER_ALL ? "WiFi + BLE" : "BLE only");
+               filterMode == FILTER_NAMED ? "BLE only" : "WiFi + BLE");
   delay(800);
   refreshList();
 }
 
 // One scroll direction that wraps, rather than separate up/down buttons —
-// Button B is needed for the filter, and three rows per page makes wrapping
-// cheap to navigate.
+// Button B is needed for the filter. Advances a page at a time rather than a
+// row: at three rows per screen, stepping by one meant 67 taps to walk a full
+// 70-device list, and each tap re-rendered two rows the user had already read.
 void scrollList() {
-  int maxTop = lastVisibleItemCount - 3;
+  // One device per step in the detail view, a whole page in the list view.
+  const int step = isDetailView() ? 1 : 3;
+  int maxTop = lastVisibleItemCount - step;
   if (maxTop < 0) maxTop = 0;
-  scrollIndex = (scrollIndex >= maxTop) ? 0 : scrollIndex + 1;
+  scrollIndex = (scrollIndex >= maxTop) ? 0 : scrollIndex + step;
+  if (scrollIndex > maxTop) scrollIndex = maxTop;
   refreshList();
 }
 
@@ -2422,15 +3005,58 @@ void scanTask(void *parameter) {
       }
     }
 
+    // A single scan batch can surface several distinct new trackers at once
+    // (e.g. walking past a shelf of AirTags). Queue every one of them here
+    // instead of only ever showing the last — trackedDevices[0] is only *this*
+    // device right when trackDevice() returns true for it (it just moved
+    // itself there), so snapshot immediately or a later device in the same
+    // batch overwrites it and the alert is lost. Shared by both bands since
+    // WiFi raises privacy-invader alerts too; drained below, outside the mutex.
+    PendingAlertInfo alertQueue[8];
+    int queuedAlerts = 0;
+
     if (localScanningWiFi) {
       // WiFi Scan (blocking)
       int n = WiFi.scanNetworks(false, false, false, 300);
 
       if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
         for (int i = 0; i < n; i++) {
-          trackWiFiDevice(WiFi.SSID(i).c_str(), WiFi.BSSIDstr(i).c_str(),
-                          WiFi.RSSI(i), WiFi.channel(i), WiFi.encryptionType(i),
-                          currentTime);
+          // Copied out rather than aliased: WiFi.BSSIDstr()/SSID() each return
+          // a temporary String, and a pointer into one dangles the moment the
+          // full expression ends.
+          char bssid[18];
+          char ssid[33];
+          strncpy(bssid, WiFi.BSSIDstr(i).c_str(), 17);
+          bssid[17] = '\0';
+          strncpy(ssid, WiFi.SSID(i).c_str(), 32);
+          ssid[32] = '\0';
+
+          // The allowlist applies to BSSIDs too. Without this a WiFi false
+          // positive would have no off switch at all — neither the menu action
+          // nor `allow add` could silence it.
+          if (isAllowlistedMac(bssid)) {
+            vTaskDelay(1 / portTICK_PERIOD_MS);
+            continue;
+          }
+
+          bool isNewInvader = trackWiFiDevice(ssid, bssid, WiFi.RSSI(i),
+                                              WiFi.channel(i),
+                                              WiFi.encryptionType(i), currentTime);
+
+          if (isNewInvader && queuedAlerts < 8) {
+            alertQueue[queuedAlerts].isSpecial = true;
+            strncpy(alertQueue[queuedAlerts].name,
+                    strlen(ssid) > 0 ? ssid : "(hidden SSID)", 20);
+            alertQueue[queuedAlerts].name[20] = '\0';
+            strncpy(alertQueue[queuedAlerts].mac, bssid, 17);
+            alertQueue[queuedAlerts].mac[17] = '\0';
+            // No persistence scoring on this path — a matching OUI is the whole
+            // finding, so report full confidence rather than a meaningless 0.00.
+            alertQueue[queuedAlerts].score = 1.0f;
+            alertQueue[queuedAlerts].trackerType = TRACKER_PRIVACY_INVADER;
+            alertQueue[queuedAlerts].isWifi = true;
+            queuedAlerts++;
+          }
           vTaskDelay(1 / portTICK_PERIOD_MS);
         }
         xSemaphoreGive(deviceMutex);
@@ -2442,15 +3068,6 @@ void scanTask(void *parameter) {
       NimBLEScanResults foundDevices = pBLEScan->getResults(2000, false);
 
       {
-        // A single scan batch can surface several distinct new trackers at
-        // once (e.g. walking past a shelf of AirTags). Queue every one of
-        // them here instead of only ever showing the last — trackedDevices[0]
-        // is only *this* device right when trackDevice() returns true for it
-        // (it just moved itself there), so snapshot immediately or a later
-        // device in the same batch overwrites it and the alert is lost.
-        PendingAlertInfo alertQueue[8];
-        int queuedAlerts = 0;
-
         if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
           int count = foundDevices.getCount();
           for (int i = 0; i < count; i++) {
@@ -2485,6 +3102,7 @@ void scanTask(void *parameter) {
                 alertQueue[queuedAlerts].mac[17] = '\0';
                 alertQueue[queuedAlerts].score = d.persistenceScore;
                 alertQueue[queuedAlerts].trackerType = d.trackerType;
+                alertQueue[queuedAlerts].isWifi = false;
                 queuedAlerts++;
               }
             }
@@ -2493,22 +3111,22 @@ void scanTask(void *parameter) {
           xSemaphoreGive(deviceMutex);
         }
 
-        // Show every queued alert in turn, outside the mutex.
-        for (int q = 0; q < queuedAlerts; q++) {
-          pendingAlertInfo = alertQueue[q];
-          showingAlert = true;
-          alertPending = true;
-
-          // Hold here until loop() (Core 1) has shown the alert and the user
-          // dismissed it. Keep feeding the watchdog — this wait is expected
-          // to last as long as the user takes to notice the alert.
-          while (showingAlert && scanTaskRunning) {
-            esp_task_wdt_reset();
-            vTaskDelay(50 / portTICK_PERIOD_MS);
-          }
-        }
-
         pBLEScan->clearResults();
+      }
+    }
+
+    // Show every queued alert in turn, outside the mutex — from either band.
+    for (int q = 0; q < queuedAlerts; q++) {
+      pendingAlertInfo = alertQueue[q];
+      showingAlert = true;
+      alertPending = true;
+
+      // Hold here until loop() (Core 1) has shown the alert and it has been
+      // dismissed — by a button or by its own timeout. Keep feeding the
+      // watchdog: this wait is expected to last as long as the alert is up.
+      while (showingAlert && scanTaskRunning) {
+        esp_task_wdt_reset();
+        vTaskDelay(50 / portTICK_PERIOD_MS);
       }
     }
 
@@ -2607,6 +3225,17 @@ void setup() {
                 (maxKnownDevices * sizeof(KnownDevice)) / 1024,
                 ESP.getFreeHeap() / 1024);
   initialFreeHeapKB = ESP.getFreeHeap() / 1024;
+
+  // Frame buffer for the repainting screens — PSRAM-backed, so it stays out of
+  // the internal heap measured just above and reported by the MEM bar. Failing
+  // to allocate is not fatal: frame() falls back to drawing straight to the
+  // panel, which is exactly the pre-sprite behaviour.
+  frameCanvas.setPsram(true);
+  frameCanvas.setColorDepth(16);
+  canvasReady = (frameCanvas.createSprite(SCREEN_WIDTH, SCREEN_HEIGHT) != nullptr);
+  Serial.printf("Frame canvas: %s (%dKB PSRAM)\n",
+                canvasReady ? "ready" : "UNAVAILABLE — falling back to direct draw",
+                (SCREEN_WIDTH * SCREEN_HEIGHT * 2) / 1024);
 
   if (!SPIFFS.begin(false)) {
     Serial.println("SPIFFS corrupted, formatting...");
@@ -2727,13 +3356,18 @@ void setup() {
   
   delay(1000);
 
-  M5.Display.fillScreen(BLACK);
-  drawTopBar();
-
-  M5.Display.setTextSize(1);
-  M5.Display.setTextColor(DARKGREY);
-  M5.Display.setCursor(60, 60);
-  M5.Display.print("Starting scans...");
+  // Composed through the frame like every other top-bar render, so this first
+  // screen matches what the list draws a moment later.
+  {
+    auto &gfx = frame();
+    gfx.fillScreen(BLACK);
+    drawTopBar();
+    gfx.setTextSize(1);
+    gfx.setTextColor(DARKGREY);
+    gfx.setCursor(60, 60);
+    gfx.print("Starting scans...");
+    framePush();
+  }
   Serial.println("Initial display ready");
 
   BaseType_t scanTaskCreated = xTaskCreatePinnedToCore(
@@ -2815,11 +3449,30 @@ void loop() {
   if (alertPending) {
     PendingAlertInfo local = pendingAlertInfo;
     alertPending = false;
-    alertUser(local.isSpecial, local.name, local.mac, local.score, local.trackerType);
+    alertUser(local.isSpecial, local.name, local.mac, local.score,
+              local.trackerType, local.isWifi);
     showingAlert = false;
     forceDisplayRefresh();
     lastDisplayUpdate = currentMillis;
     return;
+  }
+
+  // Critical battery. Checked here rather than inside drawTopBar(), where it
+  // used to sit: a render function is the wrong place to power the device off,
+  // and it did so while holding deviceMutex across a 3-second delay. Shares the
+  // memory check's interval so it isn't sampled every loop iteration.
+  if (currentMillis - lastMemoryCheck > MEMORY_CHECK_INTERVAL &&
+      batteryPercent() <= 3) {
+    M5.Display.setBrightness(204);
+    M5.Display.fillScreen(RED);
+    M5.Display.setTextSize(2);
+    M5.Display.setTextColor(WHITE);
+    M5.Display.setCursor(10, 50);
+    M5.Display.print("LOW BATTERY!");
+    M5.Display.setCursor(20, 80);
+    M5.Display.print("SHUTTING DOWN");
+    delay(3000);
+    M5.Power.powerOff();
   }
 
   if (currentMillis - lastMemoryCheck > MEMORY_CHECK_INTERVAL) {
@@ -2870,7 +3523,6 @@ void loop() {
 
     if (inMenu) {
       displayMenuScreen();
-      highlightMenuOption(menuIndex);
     } else {
       displayTrackedDevices();
     }
@@ -2898,8 +3550,7 @@ void loop() {
       // presses stay instant), B selects or, held, closes the menu.
       if (btnA && (currentMillis - lastBtnAPress > DEBOUNCE_DELAY)) {
         lastBtnAPress = currentMillis;
-        menuIndex = (menuIndex + 1) % MENU_OPTION_COUNT;
-        highlightMenuOption(menuIndex);
+        highlightMenuOption((menuIndex + 1) % MENU_OPTION_COUNT);
         lastActivityTime = currentMillis;
         return;
       }
@@ -2953,7 +3604,6 @@ void loop() {
   if (screenOn && currentMillis - lastDisplayUpdate >= DISPLAY_UPDATE_INTERVAL) {
     if (inMenu) {
       displayMenuScreen();
-      highlightMenuOption(menuIndex);
     } else {
       displayTrackedDevices();
     }
