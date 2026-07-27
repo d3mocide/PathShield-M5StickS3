@@ -125,6 +125,73 @@ Once it was, three things turned out to be wrong in practice rather than on pape
   one. Behaviour is otherwise identical (exact-MAC, BLE-only, persisted to
   `/allowlist.txt`).
 
+## Phase 5 — Render quality, alert availability, and the WiFi detection gap
+
+A code review of the whole firmware turned up three problems that are less about
+missing features than about the device not doing what it already claims to do.
+Phase 4 fixed what field testing exposed; these are what reading the code exposed.
+
+- [ ] **Flicker-free rendering via a PSRAM sprite.** Every render did
+  `M5.Display.fillScreen(BLACK)` and then repainted the whole screen field by
+  field, once a second — a visible black flash on every update, on the findings
+  list, the top bar and the settings menu alike. The repainting screens now draw
+  into a 240x135x16bpp `M5Canvas` held in PSRAM (~65KB, which the S3 has in
+  abundance and which doesn't touch the internal heap the MEM bar tracks) and
+  reach the panel as a single `pushSprite()`. Redraws also get *faster*: one bulk
+  SPI transfer instead of a few hundred small ones. Scoped to the screens that
+  repaint on a timer — the boot splash, controls sheet, feedback toasts and alert
+  screen are drawn once and left up, so they never flickered and stay on direct
+  rendering rather than being churned for consistency's sake.
+- [ ] **An alert no longer blinds the device until someone presses a button.**
+  `alertUser()` blocked on a button press with no timeout while `scanTask` spun on
+  `showingAlert`, so the moment PathShield detected something was the moment it
+  stopped looking — indefinitely, if it was in a pocket. For an anti-stalking tool
+  that is exactly backwards. The alert now auto-dismisses (the `ALERT_DURATION`
+  constant had been declared and left unused since the stability pass) and scanning
+  resumes. Because a dismissed alert shouldn't vanish without a trace, the findings
+  screen draws its border in red with an `!N` count while any alert is
+  unacknowledged, clearing once the user looks at the ALERTS filter. The border was
+  chosen over a banner row deliberately: at 240x135 the footer is already carrying
+  the filter tag, both hold hints and the page counter, and the screen edge was
+  otherwise decorative.
+- [ ] **WiFi BSSIDs are matched against the special-MAC list.** `isSpecialMac()`
+  was only ever called from `trackDevice()` — the BLE path. The Axon and Flock
+  OUIs that ship in `defaultSpecialMacs[]` therefore never alerted over WiFi,
+  despite the README billing them as "Privacy Invader Defaults" and the web
+  flasher's threat matrix listing `Axon TASER | WiFi/BLE | DETECTED`. Flock
+  cameras beacon over WiFi. This closes the largest gap between what the project
+  documents and what it does. Carries two necessary companions: the allowlist
+  (both compiled-in prefixes and the runtime list) now applies to WiFi BSSIDs
+  too, since otherwise a WiFi false positive would have no off switch; and
+  alerting WiFi entries survive `removeOldWiFiEntries()`, matching how the BLE
+  list already preserves `alertTriggered` devices.
+- [ ] **The ALERTS filter covers both bands.** Follows directly from the item
+  above: the filter pinned the view to BLE, so a WiFi hit would have been
+  invisible under the filter named "Alerts". It now renders BLE and WiFi
+  alerting devices as one combined, band-tagged list.
+
+### Deferred from the same review (not yet scoped)
+
+Recorded here so they aren't rediscovered later. Split by how much discussion
+they need, not by impact.
+
+**Straightforward:** paused view can't switch bands (`isWifiView()` keys off a
+`scanningWiFi` flag that's frozen while paused, so pausing during a BLE window
+strands you there); scrolling advances one row at a time through up to 70
+devices; battery percentage is a straight voltage lerp rather than
+`M5.Power.getBatteryLevel()`, unsmoothed so it visibly jitters, and its
+critical-shutdown path runs inside `drawTopBar()` holding `deviceMutex` across a
+3-second delay; the menu marks the current row with a `>` where inverse video
+would read far better; the flasher page's footer year is stale, its perpetual
+`flicker`/`scanline` animations have no `prefers-reduced-motion` guard, and it
+has no description or OG tags.
+
+**Needs discussion:** raw dBm vs. a signal-strength glyph; a per-device detail
+view and which gesture would open it; moving rendering out from under
+`deviceMutex` (currently held across every SPI write in the draw); making the
+O(n²) per-frame sort incremental; and a "you got an alert, now what" section in
+the README, which for an anti-stalking tool matters as much as the detection.
+
 ## Already completed (context, not part of this roadmap's phases)
 
 The stability pass that preceded this roadmap: fixed the Core0/Core1 display-and-button

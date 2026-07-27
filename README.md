@@ -113,7 +113,14 @@ Button B (hold):  Close the menu
 ### Alert Screen
 ```
 Either button:    Dismiss the alert
+(no input):       Stands down on its own after 8 seconds
 ```
+
+The alert counts down on screen. It has to time out rather than wait
+indefinitely: scanning is suspended while an alert is up, so an alert nobody is
+present to dismiss would otherwise leave the device blind for as long as it sat
+in a pocket. An alert that times out unacknowledged leaves the findings screen
+with a **red border and an `!N` count** until you look at the ALERTS filter.
 
 **Available Settings:**
 - **Alert Style**: Cycles Simple -> Quiet -> Loud. **Simple** (the default) paints one solid red screen with no animation. **Quiet** draws only a thin colored border on a black screen and doesn't force max brightness — for when a lit-up screen would draw the wrong kind of attention. **Loud** is the full-screen red/blue strobe, kept as an opt-in for when you want to be impossible to ignore.
@@ -121,8 +128,8 @@ Either button:    Dismiss the alert
 - **Brightness**: Low/High (saves battery on low brightness)
 - **Screen Timeout**: How long before the screen turns off when idle (10-300 seconds)
 - **Allowlist Top Device**: Allowlists whichever BLE device is at the top of the findings list — it disappears immediately and won't be tracked again. The menu row shows the tail of the MAC it will act on, so you can confirm the target before selecting. Useful for killing a false positive (your own phone, earbuds, car) on the spot, without editing `allowlistMacs[]` and reflashing. BLE only (not the WiFi list), and it matches the exact MAC shown, not the whole manufacturer. Persists across reboots (`/allowlist.txt`). To remove an entry later, or to allowlist a MAC you already know without waiting for it to show up on screen, use the `allow` serial command — see [No-Reflash Configuration](#no-reflash-configuration).
-- **Export Incident**: Writes a timestamped snapshot of currently-alerting devices to `/incidents.txt` on SPIFFS. Deliberate/on-demand only — nothing is logged automatically. Retrieve it by opening Serial Monitor (115200 baud, newline line ending) and sending `dump`.
-- **Clear Devices**: Clears all tracked devices from memory
+- **Export Incident**: Writes a timestamped snapshot of currently-alerting devices — BLE and WiFi both — to `/incidents.txt` on SPIFFS. Deliberate/on-demand only — nothing is logged automatically. Retrieve it by opening Serial Monitor (115200 baud, newline line ending) and sending `dump`.
+- **Clear Devices**: Clears all tracked devices from memory (BLE, WiFi and the known-device buffer), and resets the unacknowledged-alert marker
 - **Show Controls**: Displays the button cheat sheet above
 - **Shutdown**: Power off the device
 
@@ -146,19 +153,21 @@ Alert Score + Duration Since First Seen (e.g. "!0.82 3m")
 
 ### Color Codes
 ```
-CYAN    = WiFi networks / Normal Bluetooth devices
-ORANGE  = User-defined tracker (special MAC)
-RED     = Suspected tracker detected (high persistence score)
+CYAN    = Normal Bluetooth devices
+GREEN   = WiFi networks, scan active, status messages
+ORANGE  = User-defined tracker (special MAC), either band
+RED     = Suspected tracker detected (high persistence score),
+          or a screen border meaning "unacknowledged alert"
 YELLOW  = Manufacturer name
-GREEN   = Scan active, status messages
 ```
 
 ### Filter Mode
 - Tap **Button B** to cycle: "All" -> "Named" (hides unnamed/noise devices) -> "Alerts" (only currently-flagged/suspected trackers) -> back to "All"
 - Useful for cutting through noise when there are many unnamed devices, or jumping straight to what's currently flagged
 - The active filter is always named in the bottom-left of the screen
-- Filters apply to the BLE list, so **"Named" and "Alerts" pin the screen to BLE** instead of alternating to WiFi every few seconds. Scanning still covers both bands the whole time — only the view is pinned, so a filtered screen keeps showing the thing you filtered for rather than flipping back to an unfiltered WiFi list
-- If nothing matches yet, the screen says so ("No alerts", plus how many BLE devices are being tracked) rather than going blank
+- **"Alerts" spans both bands**: it merges flagged BLE devices and WiFi privacy-invader hits into one list, each row tagged `[BLE]` or `[WiFi]`. Certain hits (an OUI match on either band) sort above persistence-scored suspicions, then by score
+- **"Named" applies to the BLE list only**, so it pins the screen to BLE instead of alternating to WiFi every few seconds. Scanning still covers both bands the whole time — only the view is pinned, so a filtered screen keeps showing the thing you filtered for rather than flipping back to an unfiltered WiFi list
+- If nothing matches yet, the screen says so ("No alerts", plus how many BLE and WiFi devices are being tracked) rather than going blank
 
 ### Footer
 - **Filter tag**: The filter currently applied (`ALL`, `NAMED`, `ALERTS`)
@@ -224,6 +233,25 @@ This layered approach works because trackers must advertise these identifiers to
 - Movement correlation
 
 **Alert Threshold: ≥ 0.75 by default** — configurable without reflashing, see below.
+
+### WiFi Privacy-Invader Detection
+
+Persistence scoring is BLE-only. The WiFi side runs a single, much simpler
+check: every scanned BSSID is matched against the same OUI prefix list as BLE
+(`specialMacs`, seeded from `defaultSpecialMacs[]` — Axon and Flock OUIs by
+default), and a match alerts immediately. There's no score to cross, because
+there's nothing probabilistic about it: the OUI either belongs to that hardware
+or it doesn't. Alerting WiFi entries are then pinned on the list rather than
+ageing out after the usual detection window.
+
+The allowlist applies to BSSIDs exactly as it does to BLE MACs, so `allow add`
+and the compiled-in `allowlistMacs[]` are the way to silence a WiFi false
+positive.
+
+> [!NOTE]
+> Matching is case-insensitive. This matters more than it sounds: BLE reports
+> addresses in lowercase and WiFi reports them in uppercase, while every prefix
+> list here is written uppercase.
 
 
 
