@@ -74,7 +74,7 @@ struct FrameSnapshot {
 // build is actually running. Keep this in step with docs/manifest.json —
 // including the cache-busting `?v=` on its firmware paths, or the web flasher
 // will happily reinstall a stale binary from CDN cache.
-#define FIRMWARE_VERSION "2.4.1"
+#define FIRMWARE_VERSION "2.5.0"
 
 // M5StickS3 always has 8MB PSRAM, so device limits are fixed at boot.
 #define MAX_DEVICES_CAP 70
