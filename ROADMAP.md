@@ -170,27 +170,64 @@ Phase 4 fixed what field testing exposed; these are what reading the code expose
   invisible under the filter named "Alerts". It now renders BLE and WiFi
   alerting devices as one combined, band-tagged list.
 
-### Deferred from the same review (not yet scoped)
+## Phase 6 — Second review pass
 
-Recorded here so they aren't rediscovered later. Split by how much discussion
-they need, not by impact.
+Smaller corrections from the same review, plus the two documentation gaps it
+exposed.
 
-**Straightforward:** paused view can't switch bands (`isWifiView()` keys off a
-`scanningWiFi` flag that's frozen while paused, so pausing during a BLE window
-strands you there); scrolling advances one row at a time through up to 70
-devices; battery percentage is a straight voltage lerp rather than
-`M5.Power.getBatteryLevel()`, unsmoothed so it visibly jitters, and its
-critical-shutdown path runs inside `drawTopBar()` holding `deviceMutex` across a
-3-second delay; the menu marks the current row with a `>` where inverse video
-would read far better; the flasher page's footer year is stale, its perpetual
-`flicker`/`scanline` animations have no `prefers-reduced-motion` guard, and it
-has no description or OG tags.
+- [x] **Stopping merges the two lists.** `isWifiView()` keyed off `scanningWiFi`,
+  which is frozen while paused — so pausing during a BLE window pinned you to
+  BLE with the WiFi list unreachable until you resumed. While stopped there is
+  no band alternation to follow, so the view now shows one combined list, each
+  row tagged `[BLE]`/`[WiFi]`, reusing the merged renderer built for the ALERTS
+  filter. Fixes the band problem without inventing a gesture — every button is
+  already assigned in both scanning and paused modes.
+- [x] **Scrolling advances a page, not a row.** At three rows per screen,
+  stepping by one meant 67 taps to walk a 70-device list, re-rendering two rows
+  the reader had already read each time.
+- [x] **Battery percentage via `M5.Power.getBatteryLevel()`, smoothed.** The old
+  `(V - 3.0) / 1.2` lerp treats a lithium discharge curve as a straight line, so
+  it read high for most of a session and then fell off a cliff; unfiltered
+  samples redrawn every second also visibly jittered. Now uses M5Unified's
+  curve with an exponential moving average, in one helper shared by the top bar
+  and the settings screen instead of duplicated between them. The
+  critical-battery shutdown moved out of `drawTopBar()` into `loop()` — a render
+  function had no business powering the device off, and it did so while holding
+  `deviceMutex` across a 3-second delay.
+- [x] **Signal strength as bars or dBm, switchable.** A new **Signal Display**
+  menu row cycles BARS/dBm. Bars answer "is it getting closer?" at a glance;
+  dBm is what you want comparing two devices or writing a finding down — so
+  it's a preference, not a replacement. Persisted to `/prefs.txt`.
+- [x] **Inverse-video menu selection.** A single `>` in the margin is easy to
+  lose at this size; the highlighted row now reads from across a room. Row
+  height dropped to 9px to fit the tenth option in 135px.
+- [x] **"You got an alert — now what?" in the README.** For an anti-stalking
+  tool the response guidance matters as much as the detection, and there was
+  none: no way to tell a commuter from a follower, no capture-then-report
+  sequence, and nothing saying plainly that a quiet screen isn't proof of
+  safety. Leads with the boring explanations, because most alerts are the
+  user's own earbuds.
+- [x] **Web flasher accessibility and metadata.** The body-wide opacity flicker
+  and sweeping scanline now stop under `prefers-reduced-motion` — persistent
+  motion of exactly the kind that triggers migraine and vestibular symptoms, on
+  a page whose only job is one button. Added a description, favicon and OG tags
+  so shared links preview as something; replaced the stale hardcoded "2024".
 
-**Needs discussion:** raw dBm vs. a signal-strength glyph; a per-device detail
-view and which gesture would open it; moving rendering out from under
-`deviceMutex` (currently held across every SPI write in the draw); making the
-O(n²) per-frame sort incremental; and a "you got an alert, now what" section in
-the README, which for an anti-stalking tool matters as much as the detection.
+### Still open
+
+- [ ] **Per-device detail view.** Wanted, but every gesture is assigned in both
+  scanning and paused modes, so it needs either a repurposed button, a menu row
+  (the precedent Phase 4 set when it moved allowlisting off a hidden gesture),
+  or a change to what "paused" means. Under discussion.
+- [ ] **Move rendering out from under `deviceMutex`.** `displayTrackedDevices()`
+  holds the mutex across every SPI write. `scanTask` needs the same mutex to
+  record results and gives up after 2000ms, so a slow frame can make an entire
+  scan batch get dropped. Fix is to copy the ≤3 visible rows under the lock,
+  release, then draw. The O(n²) per-frame bubble sort (~2,400 comparisons at 70
+  devices, re-run every frame inside that same lock) is the same problem and
+  should be made incremental at the same time — it matters mainly because of
+  how long it holds the lock.
+- [ ] **IMU-based motion correlation.** Carried over from Phase 3.
 
 ## Already completed (context, not part of this roadmap's phases)
 

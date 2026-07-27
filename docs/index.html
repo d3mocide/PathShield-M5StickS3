@@ -4,6 +4,13 @@
   <meta charset="utf-8">
   <title>PathShield :: Tracker Detection System</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Web installer for PathShield, an RF awareness tool for the M5StickS3. Scans BLE and WiFi for nearby trackers and alerts on devices that follow you.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%F0%9F%9B%A1%EF%B8%8F%3C/text%3E%3C/svg%3E">
+  <meta property="og:title" content="PathShield — M5StickS3">
+  <meta property="og:description" content="Web installer for PathShield, an RF awareness tool for the M5StickS3. Scans BLE and WiFi for nearby trackers and alerts on devices that follow you.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://d3mocide.github.io/PathShield-M5StickS3/">
+  <meta name="twitter:card" content="summary">
   <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
   <style>
     * {
@@ -287,6 +294,25 @@
       margin: 20px 0;
     }
 
+    /* The CRT treatment is decoration, not information. A body-wide opacity
+       flicker and a sweeping scanline are exactly the kind of persistent motion
+       that triggers migraine and vestibular symptoms, and they keep a mobile GPU
+       busy on a page whose only job is one button. Everything below still
+       renders identically — it just holds still. */
+    @media (prefers-reduced-motion: reduce) {
+      body {
+        animation: none;
+      }
+
+      body::after {
+        display: none;
+      }
+
+      .blink {
+        animation: none;
+      }
+    }
+
     @media (max-width: 768px) {
       body {
         padding: 10px;
@@ -392,7 +418,7 @@
     </div>
 
     <div class="footer">
-      MIT LICENSE • OPEN SOURCE • 2024
+      MIT LICENSE • OPEN SOURCE • <a href="https://github.com/d3mocide/PathShield-M5StickS3">SOURCE</a>
       <br>
       For security research and privacy protection only
     </div>

@@ -29,12 +29,13 @@ PathShield is an RF awareness tool for the M5StickS3. It uses BLE/WiFi scanning 
 3. [Controls](#controls)
 4. [Display Guide](#display-guide)
 5. [Detection Algorithm](#detection-algorithm)
-6. [No-Reflash Configuration](#no-reflash-configuration)
-7. [Customization](#customization)
-8. [Troubleshooting](#troubleshooting)
-9. [Known Limitations](#known-limitations)
-10. [Credits](#credits)
-11. [License](#license)
+6. [You Got an Alert — Now What?](#you-got-an-alert--now-what)
+7. [No-Reflash Configuration](#no-reflash-configuration)
+8. [Customization](#customization)
+9. [Troubleshooting](#troubleshooting)
+10. [Known Limitations](#known-limitations)
+11. [Credits](#credits)
+12. [License](#license)
 
 
 ## Features
@@ -93,7 +94,7 @@ itself — it's shown for a few seconds at boot, and is available any time from
 
 ### Scanning / List
 ```
-Button A (tap):   Scroll the list (wraps around at the end)
+Button A (tap):   Next page of the list (wraps around at the end)
 Button B (tap):   Cycle filter (All -> Named -> Alerts -> All)
 Button A (hold):  Stop / start scanning
 Button B (hold):  Open the settings menu
@@ -102,6 +103,15 @@ Button B (hold):  Open the settings menu
 Hold **A** to stop scanning, hold **A** again to start it back up — the same
 button gates both directions. Hold **B** is the only way into the settings
 menu.
+
+Tapping **A** advances a whole page (three rows), not one row — walking a full
+70-device list one row at a time took 67 taps.
+
+**Stopping merges the two lists.** While scanning, the screen alternates between
+the WiFi and BLE lists; while stopped there's no alternation to follow, so it
+shows one combined list instead, each row tagged `[BLE]` or `[WiFi]`. Previously
+the view froze on whichever band happened to be showing, and the other list was
+unreachable until you resumed.
 
 ### Settings Menu
 ```
@@ -127,6 +137,7 @@ with a **red border and an `!N` count** until you look at the ALERTS filter.
 - **Alert Sound**: On/Off. A short double-beep on alert via the StickS3's onboard speaker, independent of the visual style.
 - **Brightness**: Low/High (saves battery on low brightness)
 - **Screen Timeout**: How long before the screen turns off when idle (10-300 seconds)
+- **Signal Display**: Cycles BARS/dBm. **BARS** (the default) draws signal strength as a four-bar glyph — quicker to judge at a glance, and the thing you want when the question is "is it getting closer?". **dBm** shows the raw figure, which is what you want when comparing two devices or writing a finding down.
 - **Allowlist Top Device**: Allowlists whichever BLE device is at the top of the findings list — it disappears immediately and won't be tracked again. The menu row shows the tail of the MAC it will act on, so you can confirm the target before selecting. Useful for killing a false positive (your own phone, earbuds, car) on the spot, without editing `allowlistMacs[]` and reflashing. BLE only (not the WiFi list), and it matches the exact MAC shown, not the whole manufacturer. Persists across reboots (`/allowlist.txt`). To remove an entry later, or to allowlist a MAC you already know without waiting for it to show up on screen, use the `allow` serial command — see [No-Reflash Configuration](#no-reflash-configuration).
 - **Export Incident**: Writes a timestamped snapshot of currently-alerting devices — BLE and WiFi both — to `/incidents.txt` on SPIFFS. Deliberate/on-demand only — nothing is logged automatically. Retrieve it by opening Serial Monitor (115200 baud, newline line ending) and sending `dump`.
 - **Clear Devices**: Clears all tracked devices from memory (BLE, WiFi and the known-device buffer), and resets the unacknowledged-alert marker
@@ -146,10 +157,15 @@ Each device shows:
 ```
 Device Name (BLE) or SSID (WiFi)
 Manufacturer (identified from MAC)
-Detection Count + Signal Strength (RSSI)
+Detection Count + Signal Strength (bars, or dBm — see Signal Display)
   -- or, once flagged as a suspected tracker --
 Alert Score + Duration Since First Seen (e.g. "!0.82 3m")
 ```
+
+Signal bars read: 4 bars ≥ -60 dBm (close), 3 ≥ -70 (nearby), 2 ≥ -80
+(present but distant), 1 below that (at the edge of range). Unlit bars are
+still outlined, so the glyph reads as "1 of 4" rather than as a shape that
+changes size.
 
 ### Color Codes
 ```
@@ -254,6 +270,83 @@ positive.
 > list here is written uppercase.
 
 
+
+## You Got an Alert — Now What?
+
+An alert means *"this device has been around you long enough, or matches a
+signature closely enough, to be worth a look."* It is a prompt to pay attention,
+not a conclusion. Read the rest of this section before acting on one.
+
+### First, rule out the boring explanation
+
+Most alerts are not stalkers. In rough order of likelihood:
+
+1. **Your own kit.** Earbuds, a watch, a car head unit, a laptop — anything that
+   travels with you looks exactly like a tracker to a persistence algorithm,
+   because it *is* persistently near you. Allowlist it (**Settings → Allowlist
+   Top Device**, or `allow add <MAC>`) and it will stop asking.
+2. **Someone travelling the same way you are.** A fellow passenger on the same
+   train, a colleague on the same commute, a neighbour on the same street. Same
+   signature, no intent.
+3. **Fixed infrastructure you passed slowly.** A shop's beacon, a smart TV, a
+   parked car. Usually distinguishable because the signal fades and doesn't come
+   back once you've moved on.
+
+### What actually distinguishes a follower
+
+One alert is nearly meaningless. What matters is **the same MAC reappearing
+across separate trips, on different days, along different routes.** A tracker
+you cannot shake is a pattern over time, not a single reading.
+
+- **Duration** — the `3m` / `1h05m` next to the score is time since first seen.
+  Hours is more interesting than minutes.
+- **Signal behaviour** — a device that stays at a *constant* strength while you
+  move is more concerning than one that fades in and out. That's what the
+  persistence score is trying to capture.
+- **Recurrence across contexts** — note the MAC. If it's there tomorrow,
+  somewhere else, that's the signal worth acting on.
+- **A named tracker type** (`AirTag`, `Tile`, `SmartTag`, `Chipolo`) means the
+  protocol was positively identified, not inferred from behaviour. That is a
+  much stronger finding than a persistence-only hit.
+
+> [!IMPORTANT]
+> Modern trackers rotate their MAC addresses, typically every 15 minutes. A
+> changing MAC does **not** mean you're safe, and it does mean "same MAC over
+> days" is a strong signal when you do see it, but not one you can rely on
+> seeing. Apple AirTags separated from their owner also emit an audible chirp —
+> a physical search matters as much as this device does.
+
+### If you think it's real
+
+1. **Capture it.** **Settings → Export Incident** writes a timestamped snapshot
+   to `/incidents.txt`. Do this *while it's happening* — the tracked list ages
+   out, and a record you can hand to someone else is worth more than a screen you
+   remember. Retrieve with `dump` over serial.
+2. **Do a physical search.** Bag linings, coat pockets, wheel arches, under
+   bumpers, inside seat pockets. PathShield tells you something is near you; it
+   cannot tell you where.
+3. **Don't destroy it or confront anyone.** A tracker in your possession is
+   evidence, and its location history may matter later. Confrontation escalates a
+   situation you don't yet understand.
+4. **Contact people who can act.** Local police, a domestic-abuse helpline, or
+   your national anti-stalking service. Bring the export and your notes.
+5. **Use the official tools too.** iOS and Android both have built-in unwanted-
+   tracker detection that can make an AirTag play a sound and surface its serial
+   number — which PathShield cannot do.
+
+> [!CAUTION]
+> **PathShield is not evidence and not a safety guarantee.** It detects radio
+> signals, nothing more. It cannot see a tracker that is powered off, out of
+> range, wired into a vehicle, or using a protocol it doesn't know. **A quiet
+> screen is not proof that nobody is following you.** If you believe you are in
+> danger, act on that belief regardless of what this device shows.
+
+### Tuning after a false positive
+
+If a device keeps alerting and you've satisfied yourself it's benign, allowlist
+it rather than raising the threshold — allowlisting removes one device, while
+raising the threshold makes the device less sensitive to *everything*. See
+[Too Many False Positives](#too-many-false-positives).
 
 ## No-Reflash Configuration
 

@@ -90,8 +90,10 @@ const unsigned long DEBOUNCE_DELAY = 200;
 bool inMenu = false;
 int menuIndex = 0;
 int menuBaseY = 0;
-#define MENU_OPTION_COUNT 9
-#define MENU_ROW_H 10
+#define MENU_OPTION_COUNT 10
+// 9px rows fit ten options plus the status line, divider and footer hint in
+// 135px; the 8px font leaves a 1px gap. At 10px the tenth row ran off screen.
+#define MENU_ROW_H 9
 
 // How long a button must stay down to count as a hold rather than a tap.
 // Every hold gesture uses this one value so "hold" means the same thing
@@ -110,6 +112,12 @@ FilterMode filterMode = FILTER_ALL;
 enum AlertStyle : uint8_t { ALERT_LOUD = 0, ALERT_SIMPLE = 1, ALERT_QUIET = 2 };
 AlertStyle alertStyle = ALERT_SIMPLE;
 bool alertSoundEnabled = true;
+
+// How signal strength reads on the findings list: a four-bar glyph, or the raw
+// dBm figure. Bars are quicker to judge at a glance ("is it getting closer?"),
+// dBm is what you want when comparing two devices or reporting a finding — so
+// this is a preference rather than a replacement. Persisted to /prefs.txt.
+bool showSignalBars = true;
 
 const char *alertStyleName(AlertStyle style) {
   switch (style) {
@@ -1027,7 +1035,7 @@ void drawControlsScreen() {
 
   M5.Display.setTextColor(WHITE);
   M5.Display.setCursor(2, 28);
-  M5.Display.print(" A       Scroll list");
+  M5.Display.print(" A       Next page of list");
   M5.Display.setCursor(2, 38);
   M5.Display.print(" B       Filter: All/Named/Alerts");
   M5.Display.setTextColor(GREEN);
@@ -1085,7 +1093,7 @@ void showControlsScreen(unsigned long timeoutMs) {
 void printControlsToSerial() {
   Serial.println("--- PathShield controls (HOLD = press for 1 second) ---");
   Serial.println("  Scanning / list:");
-  Serial.println("    A         Scroll the list");
+  Serial.println("    A         Next page of the list");
   Serial.println("    B         Cycle filter: All -> Named -> Alerts");
   Serial.println("    HOLD A    Stop / start scanning");
   Serial.println("    HOLD B    Open the settings menu");
@@ -1178,9 +1186,23 @@ bool isWifiView() {
   return scanningWiFi && filterMode == FILTER_ALL;
 }
 
-// The ALERTS filter draws a single list merged across both bands, so it is
-// neither the WiFi view nor the BLE view.
-bool isMergedAlertsView() {
+// Two cases draw a single list merged across both bands, so they are neither
+// the WiFi view nor the BLE view:
+//
+//   - the ALERTS filter, so a WiFi privacy-invader hit isn't hidden by a
+//     filter named "Alerts";
+//   - anything paused, because the band the view happens to be pinned to when
+//     you stop scanning is arbitrary. isWifiView() keys off scanningWiFi, which
+//     is frozen while paused, so pausing during a BLE window used to strand you
+//     on BLE with no way to reach the WiFi list at all.
+bool isMergedView() {
+  return filterMode == FILTER_ALERTS || paused;
+}
+
+// Whether the merged view shows everything or only what's flagged. Pausing is
+// for looking over what you caught, so it shows the lot; the ALERTS filter is
+// for cutting to what matters, so it doesn't.
+bool mergedViewAlertsOnly() {
   return filterMode == FILTER_ALERTS;
 }
 
@@ -1189,7 +1211,7 @@ bool isMergedAlertsView() {
 // view as one or the other.
 const char *scanModeLabel() {
   if (paused) return "PAUSE";
-  if (isMergedAlertsView()) return scanningWiFi ? "WiFi" : "BLE";
+  if (isMergedView()) return scanningWiFi ? "WiFi" : "BLE";
   return displayingWifiView ? "WiFi" : "BLE";
 }
 
@@ -1209,6 +1231,32 @@ uint16_t filterColor(FilterMode mode) {
   }
 }
 
+// Battery percentage, smoothed. Two things were wrong with reading it inline:
+// the old (V - 3.0) / 1.2 lerp treats a lithium cell's discharge curve as a
+// straight line, so it reads high for most of a session and then falls off a
+// cliff; and an unfiltered sample redrawn every second visibly jitters.
+// M5Unified's getBatteryLevel() already does the curve properly for this
+// hardware, so this just guards it and applies an exponential moving average.
+// Returns 0-100.
+int batteryPercent() {
+  static float smoothed = -1.0f;
+
+  int32_t level = M5.Power.getBatteryLevel();
+
+  // Negative means the driver couldn't read it; keep the last good value
+  // rather than flashing a bogus 0% and tripping the low-battery path.
+  if (level < 0 || level > 100) {
+    return (smoothed < 0.0f) ? 100 : (int)(smoothed + 0.5f);
+  }
+
+  if (smoothed < 0.0f) {
+    smoothed = (float)level;
+  } else {
+    smoothed += ((float)level - smoothed) * 0.2f;
+  }
+  return (int)(smoothed + 0.5f);
+}
+
 // The surface the repainting screens draw into. Both M5GFX and M5Canvas derive
 // from LovyanGFX, so this is the sprite when it allocated and the panel itself
 // when it didn't — same output either way, the fallback just flickers like it
@@ -1224,6 +1272,30 @@ inline void framePush() {
   if (canvasReady) frameCanvas.pushSprite(0, 0);
 }
 
+// Signal strength as a four-bar glyph, drawn from (x, y) in a 21x8 box so it
+// occupies roughly the same width as the "-75dB" text it replaces. Thresholds
+// are the usual BLE/WiFi rules of thumb: -60 and up is close, -70 nearby,
+// -80 present-but-distant, below that is at the edge of RSSI_FLOOR.
+void drawSignalBars(LovyanGFX &gfx, int x, int y, int rssi, uint16_t color) {
+  int bars = 1;
+  if (rssi >= -60)      bars = 4;
+  else if (rssi >= -70) bars = 3;
+  else if (rssi >= -80) bars = 2;
+
+  for (int i = 0; i < 4; i++) {
+    int h = 2 + i * 2;
+    int bx = x + i * 5;
+    int by = y + (8 - h);
+    if (i < bars) {
+      gfx.fillRect(bx, by, 4, h, color);
+    } else {
+      // Unlit bars still drawn, so the glyph reads as "1 of 4" rather than as
+      // a shape that changes size with the signal.
+      gfx.drawRect(bx, by, 4, h, BLUE_GREY);
+    }
+  }
+}
+
 // Composes into the shared frame — the caller is responsible for framePush().
 void drawTopBar() {
   auto &gfx = frame();
@@ -1236,32 +1308,10 @@ void drawTopBar() {
   gfx.setTextColor(paused ? RED : GREEN);
   gfx.print(scanModeLabel());
 
-  static float lastValidBatVoltage = 3.7f;
-  float batVoltage = M5.Power.getBatteryVoltage() / 1000.0f;
-
-  // Filter out obviously bad readings (sensor errors), but allow real low battery
-  if (batVoltage > 2.0f && batVoltage < 4.5f) {
-    lastValidBatVoltage = batVoltage;
-  } else {
-    batVoltage = lastValidBatVoltage;
-  }
-
-  // Critical battery check - force shutdown if critically low
-  if (batVoltage < 3.0f && batVoltage > 2.0f) {
-    M5.Display.fillScreen(RED);
-    M5.Display.setTextSize(2);
-    M5.Display.setTextColor(WHITE);
-    M5.Display.setCursor(10, 50);
-    M5.Display.print("LOW BATTERY!");
-    M5.Display.setCursor(20, 80);
-    M5.Display.print("SHUTTING DOWN");
-    delay(3000);
-    M5.Power.powerOff();
-  }
-
-  int batPercent = (int)((batVoltage - 3.0f) / 1.2f * 100.0f);
-  if (batPercent > 100) batPercent = 100;
-  if (batPercent < 0) batPercent = 0;
+  // Reading only — the critical-battery shutdown lives in loop() now. It had no
+  // business running inside a render function, where it blocked on a 3-second
+  // delay while holding deviceMutex.
+  int batPercent = batteryPercent();
 
   int barWidth = 30;
   int barX = 75;
@@ -1329,7 +1379,7 @@ uint32_t getDisplayStateHash() {
 
   // The merged alerts view renders rows from both arrays, so it has to watch
   // both — hashing only one would leave the other's changes off screen.
-  if (isWifiView() || isMergedAlertsView()) {
+  if (isWifiView() || isMergedView()) {
     for (int i = 0; i < wifiDeviceIndex; i++) {
       hash = hash * 31 + (uint32_t)wifiDevices[i].rssi;
       hash = hash * 31 + wifiDevices[i].detectionCount;
@@ -1445,7 +1495,7 @@ void displayTrackedDevices() {
   const int maxDisplay = 3;
   int totalItems = 0;
 
-  if (isMergedAlertsView()) {
+  if (isMergedView()) {
     // One list across both bands. "Alerts" that silently omitted every WiFi hit
     // would be a trap, now that a privacy-invader OUI can match a BSSID.
     // Definite hits (an OUI match on either band) sort above persistence-scored
@@ -1453,20 +1503,25 @@ void displayTrackedDevices() {
     struct AlertRow { bool isWifi; int idx; float rank; };
     AlertRow rows[MAX_DEVICES_CAP + MAX_WIFI_DEVICES_CAP];
     int rowCount = 0;
+    const bool alertsOnly = mergedViewAlertsOnly();
 
     for (int i = 0; i < deviceIndex; i++) {
-      if (!trackedDevices[i].detected) continue;
+      if (alertsOnly && !trackedDevices[i].detected) continue;
       rows[rowCount].isWifi = false;
       rows[rowCount].idx = i;
-      rows[rowCount].rank = (trackedDevices[i].isSpecial ? 2.0f : 1.0f) +
-                            trackedDevices[i].persistenceScore;
+      // Flagged devices outrank background ones, so a paused browse still puts
+      // anything alerting at the top rather than burying it mid-list.
+      rows[rowCount].rank = trackedDevices[i].detected
+                                ? (trackedDevices[i].isSpecial ? 2.0f : 1.0f) +
+                                      trackedDevices[i].persistenceScore
+                                : -1.0f;
       rowCount++;
     }
     for (int i = 0; i < wifiDeviceIndex; i++) {
-      if (!wifiDevices[i].isSpecial) continue;
+      if (alertsOnly && !wifiDevices[i].isSpecial) continue;
       rows[rowCount].isWifi = true;
       rows[rowCount].idx = i;
-      rows[rowCount].rank = 3.0f;
+      rows[rowCount].rank = wifiDevices[i].isSpecial ? 3.0f : -2.0f;
       rowCount++;
     }
 
@@ -1488,12 +1543,16 @@ void displayTrackedDevices() {
       gfx.setTextSize(2);
       gfx.setTextColor(filterColor(filterMode));
       gfx.setCursor(2, 45);
-      gfx.print("No alerts");
+      gfx.print(alertsOnly ? "No alerts" : "Nothing yet");
       gfx.setTextSize(1);
       gfx.setTextColor(DARKGREY);
       gfx.setCursor(2, 70);
-      gfx.printf("%d BLE / %d WiFi tracked, none flagged", deviceIndex,
-                 wifiDeviceIndex);
+      if (alertsOnly) {
+        gfx.printf("%d BLE / %d WiFi tracked, none flagged", deviceIndex,
+                   wifiDeviceIndex);
+      } else {
+        gfx.print("Nothing tracked yet");
+      }
       drawListFooterHint();
       framePush();
       xSemaphoreGive(deviceMutex);
@@ -1523,7 +1582,7 @@ void displayTrackedDevices() {
       if (rows[r].isWifi) {
         WiFiDeviceInfo &w = wifiDevices[rows[r].idx];
 
-        gfx.setTextColor(ORANGE);
+        gfx.setTextColor(w.isSpecial ? ORANGE : WIFI_NAME_COLOR);
         gfx.setTextSize(2);
         gfx.setCursor(2, y);
         char ssidDisplay[20];
@@ -1539,7 +1598,7 @@ void displayTrackedDevices() {
 
         gfx.setTextSize(1);
         gfx.setCursor(2, y);
-        gfx.setTextColor(ORANGE);
+        gfx.setTextColor(w.isSpecial ? ORANGE : WIFI_NAME_COLOR);
         gfx.print("[WiFi] ");
         gfx.setTextColor(YELLOW);
         char mfgDisplay[22];
@@ -1549,7 +1608,12 @@ void displayTrackedDevices() {
 
         gfx.setCursor(2, y);
         gfx.setTextColor(WHITE);
-        gfx.printf("Ch%d %ddB", w.channel, w.rssi);
+        gfx.printf("Ch%d ", w.channel);
+        if (showSignalBars) {
+          drawSignalBars(gfx, gfx.getCursorX(), y, w.rssi, WHITE);
+        } else {
+          gfx.printf("%ddB", w.rssi);
+        }
         gfx.setCursor(80, y);
         gfx.setTextColor(BLUE_GREY);
         gfx.print(w.bssid);
@@ -1557,7 +1621,7 @@ void displayTrackedDevices() {
       } else {
         DeviceInfo &d = trackedDevices[rows[r].idx];
 
-        gfx.setTextColor(d.isSpecial ? ORANGE : RED);
+        gfx.setTextColor(d.isSpecial ? ORANGE : (d.detected ? RED : BLE_NAME_COLOR));
         gfx.setTextSize(2);
         gfx.setCursor(2, y);
         char nameDisplay[20];
@@ -1588,17 +1652,31 @@ void displayTrackedDevices() {
         y += 9;
 
         gfx.setCursor(2, y);
-        gfx.setTextColor(RED);
-        gfx.print("!");
-        gfx.setTextColor(YELLOW);
-        gfx.print(d.persistenceScore, 2);
-        char durStr[10];
-        unsigned long nowSec = now / 1000;
-        unsigned long elapsed = (nowSec >= d.firstSeen) ? (nowSec - d.firstSeen) : 0;
-        formatDuration(elapsed, durStr, sizeof(durStr));
-        gfx.setTextColor(WHITE);
-        gfx.print(" ");
-        gfx.print(durStr);
+        if (d.detected) {
+          gfx.setTextColor(RED);
+          gfx.print("!");
+          gfx.setTextColor(YELLOW);
+          gfx.print(d.persistenceScore, 2);
+          char durStr[10];
+          unsigned long nowSec = now / 1000;
+          unsigned long elapsed = (nowSec >= d.firstSeen) ? (nowSec - d.firstSeen) : 0;
+          formatDuration(elapsed, durStr, sizeof(durStr));
+          gfx.setTextColor(WHITE);
+          gfx.print(" ");
+          gfx.print(durStr);
+        } else {
+          // Background device in a paused browse — same count+signal format the
+          // unpaused BLE list uses, so the row doesn't change shape on pause.
+          gfx.setTextColor(WHITE);
+          gfx.print(d.totalCount);
+          gfx.print("x ");
+          if (showSignalBars) {
+            drawSignalBars(gfx, gfx.getCursorX(), y, d.lastRssi, WHITE);
+          } else {
+            gfx.print(d.lastRssi);
+            gfx.print("dB");
+          }
+        }
         gfx.setCursor(80, y);
         gfx.setTextColor(BLUE_GREY);
         gfx.print(d.address);
@@ -1671,8 +1749,12 @@ void displayTrackedDevices() {
       gfx.setTextColor(DARKGREY);
       gfx.print(wifiDevices[i].detectionCount);
       gfx.print("x ");
-      gfx.print(wifiDevices[i].rssi);
-      gfx.print("dB");
+      if (showSignalBars) {
+        drawSignalBars(gfx, gfx.getCursorX(), y, wifiDevices[i].rssi, DARKGREY);
+      } else {
+        gfx.print(wifiDevices[i].rssi);
+        gfx.print("dB");
+      }
       y += 11;
     }
   } else {
@@ -1816,8 +1898,12 @@ void displayTrackedDevices() {
         gfx.setTextColor(WHITE);
         gfx.print(trackedDevices[i].totalCount);
         gfx.print("x ");
-        gfx.print(trackedDevices[i].lastRssi);
-        gfx.print("dB");
+        if (showSignalBars) {
+          drawSignalBars(gfx, gfx.getCursorX(), y, trackedDevices[i].lastRssi, WHITE);
+        } else {
+          gfx.print(trackedDevices[i].lastRssi);
+          gfx.print("dB");
+        }
       }
 
       gfx.setCursor(80, y);
@@ -1879,21 +1965,9 @@ void displayMenuScreen() {
   gfx.setTextColor(WHITE);
   gfx.setCursor(2, y);
 
-  static float lastValidBatVoltage = 3.7f;
-  float batVoltage = M5.Power.getBatteryVoltage() / 1000.0f;
-
-  // Filter out obviously bad readings (sensor errors), but allow real low battery
-  if (batVoltage > 2.0f && batVoltage < 4.5f) {
-    lastValidBatVoltage = batVoltage;
-  } else {
-    batVoltage = lastValidBatVoltage;
-  }
-
-  int batPercent = (int)((batVoltage - 3.0f) / 1.2f * 100.0f);
-  if (batPercent > 100) batPercent = 100;
-  if (batPercent < 0) batPercent = 0;
+  int batPercent = batteryPercent();
   float estHoursRemaining = (batPercent / 100.0f) * TYPICAL_BATTERY_LIFE_HOURS;
-  // Everything status-y on one line — nine menu rows need the vertical space.
+  // Everything status-y on one line — ten menu rows need the vertical space.
   gfx.print("Bat:");
   gfx.print(batPercent);
   gfx.print("% ~");
@@ -1930,35 +2004,39 @@ void displayMenuScreen() {
   // a list of verbs whose effect you only learn by pressing them.
   const char *labels[MENU_OPTION_COUNT] = {
     "Alert Style",  "Alert Sound",     "Brightness",    "Screen Timeout",
-    "Allowlist Top Device", "Export Incident", "Clear Devices",
-    "Show Controls", "Shutdown"
+    "Signal Display", "Allowlist Top Device", "Export Incident",
+    "Clear Devices", "Show Controls", "Shutdown"
   };
   const char *values[MENU_OPTION_COUNT] = {
     alertStyleName(alertStyle),
     alertSoundEnabled ? "ON" : "OFF",
     highBrightness ? "HIGH" : "LOW",
     timeoutStr,
+    showSignalBars ? "BARS" : "dBm",
     allowTarget,
     "", "", "", ""
   };
 
+  // Inverse video for the selected row rather than a ">" in the margin — at
+  // this size a single caret is easy to lose, and the highlight reads as
+  // "you are here" from across a room.
   for (int i = 0; i < MENU_OPTION_COUNT; i++) {
-    gfx.setTextColor(CYAN);
-    gfx.setCursor(10, y);
+    bool selected = (i == menuIndex);
+
+    if (selected) {
+      gfx.fillRect(0, y - 1, SCREEN_WIDTH, MENU_ROW_H, CYAN);
+    }
+
+    gfx.setTextColor(selected ? BLACK : CYAN);
+    gfx.setCursor(4, y);
     gfx.print(labels[i]);
     if (strlen(values[i]) > 0) {
-      gfx.setTextColor(WHITE);
+      gfx.setTextColor(selected ? BLACK : WHITE);
       gfx.setCursor(SCREEN_WIDTH - 4 - (int)(strlen(values[i]) * 6), y);
       gfx.print(values[i]);
     }
     y += MENU_ROW_H;
   }
-
-  // The selection caret is part of the frame now rather than a separate partial
-  // repaint — see highlightMenuOption().
-  gfx.setCursor(2, menuBaseY + (menuIndex * MENU_ROW_H));
-  gfx.setTextColor(YELLOW);
-  gfx.print(">");
 
   gfx.drawLine(0, y, SCREEN_WIDTH, y, DARKGREY);
 
@@ -1995,6 +2073,8 @@ void saveUserPreferences() {
   file.println((int)alertStyle);
   file.print("sound=");
   file.println(alertSoundEnabled ? "1" : "0");
+  file.print("signalbars=");
+  file.println(showSignalBars ? "1" : "0");
   file.print("persistThresh=");
   file.println(persistenceThreshold, 2);
   file.print("rssiStable=");
@@ -2033,6 +2113,8 @@ void loadUserPreferences() {
       }
     } else if (line.startsWith("sound=")) {
       alertSoundEnabled = line.substring(6).toInt() == 1;
+    } else if (line.startsWith("signalbars=")) {
+      showSignalBars = line.substring(11).toInt() == 1;
     } else if (line.startsWith("persistThresh=")) {
       float v = line.substring(14).toFloat();
       if (v >= 0.0f && v <= 1.0f) persistenceThreshold = v;
@@ -2512,6 +2594,7 @@ void printSerialConfig() {
   Serial.printf("  alert style     = %s  (LOUD strobes, SIMPLE fills, QUIET borders)\n",
                 alertStyleName(alertStyle));
   Serial.printf("  alert sound     = %s\n", alertSoundEnabled ? "ON" : "OFF");
+  Serial.printf("  signal display  = %s\n", showSignalBars ? "BARS" : "dBm");
   handleSpecialCommand("list", NULL);
   handleAllowCommand("list", NULL);
   handleThresholdCommand("list", NULL, NULL);
@@ -2579,9 +2662,12 @@ void executeMenuOption(int index) {
       cycleScreenTimeout();
       break;
     case 4:
+      toggleSignalDisplay();
+      break;
+    case 5:
       allowlistTopDevice();
       break;
-    case 5: {
+    case 6: {
       int exported = exportIncident();
       char msg[16];
       snprintf(msg, sizeof(msg), "%d EXPORTED", exported);
@@ -2589,15 +2675,15 @@ void executeMenuOption(int index) {
       delay(1000);
       break;
     }
-    case 6:
+    case 7:
       clearDevices();
       showFeedback("CLEARED", GREEN);
       delay(1000);
       break;
-    case 7:
+    case 8:
       showControlsScreen(0);
       break;
-    case 8:
+    case 9:
       shutdownDevice();
       return;
   }
@@ -2642,6 +2728,14 @@ void cycleAlertStyle() {
                : alertStyle == ALERT_LOUD ? "Red/blue strobe"
                                           : "Solid screen, no flashing");
   delay(1200);
+}
+
+void toggleSignalDisplay() {
+  showSignalBars = !showSignalBars;
+  saveUserPreferences();
+  showFeedback(showSignalBars ? "BARS" : "dBm", CYAN,
+               showSignalBars ? "Signal as 4-bar glyph" : "Signal as raw dBm");
+  delay(1000);
 }
 
 void toggleAlertSound() {
@@ -2745,12 +2839,15 @@ void cycleFilter() {
 }
 
 // One scroll direction that wraps, rather than separate up/down buttons —
-// Button B is needed for the filter, and three rows per page makes wrapping
-// cheap to navigate.
+// Button B is needed for the filter. Advances a page at a time rather than a
+// row: at three rows per screen, stepping by one meant 67 taps to walk a full
+// 70-device list, and each tap re-rendered two rows the user had already read.
 void scrollList() {
-  int maxTop = lastVisibleItemCount - 3;
+  const int rowsPerPage = 3;
+  int maxTop = lastVisibleItemCount - rowsPerPage;
   if (maxTop < 0) maxTop = 0;
-  scrollIndex = (scrollIndex >= maxTop) ? 0 : scrollIndex + 1;
+  scrollIndex = (scrollIndex >= maxTop) ? 0 : scrollIndex + rowsPerPage;
+  if (scrollIndex > maxTop) scrollIndex = maxTop;
   refreshList();
 }
 
@@ -3259,6 +3356,24 @@ void loop() {
     forceDisplayRefresh();
     lastDisplayUpdate = currentMillis;
     return;
+  }
+
+  // Critical battery. Checked here rather than inside drawTopBar(), where it
+  // used to sit: a render function is the wrong place to power the device off,
+  // and it did so while holding deviceMutex across a 3-second delay. Shares the
+  // memory check's interval so it isn't sampled every loop iteration.
+  if (currentMillis - lastMemoryCheck > MEMORY_CHECK_INTERVAL &&
+      batteryPercent() <= 3) {
+    M5.Display.setBrightness(204);
+    M5.Display.fillScreen(RED);
+    M5.Display.setTextSize(2);
+    M5.Display.setTextColor(WHITE);
+    M5.Display.setCursor(10, 50);
+    M5.Display.print("LOW BATTERY!");
+    M5.Display.setCursor(20, 80);
+    M5.Display.print("SHUTTING DOWN");
+    delay(3000);
+    M5.Power.powerOff();
   }
 
   if (currentMillis - lastMemoryCheck > MEMORY_CHECK_INTERVAL) {
