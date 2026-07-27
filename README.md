@@ -104,14 +104,26 @@ Hold **A** to stop scanning, hold **A** again to start it back up — the same
 button gates both directions. Hold **B** is the only way into the settings
 menu.
 
-Tapping **A** advances a whole page (three rows), not one row — walking a full
-70-device list one row at a time took 67 taps.
+While scanning, tapping **A** advances a whole page (three rows), not one row —
+walking a full 70-device list one row at a time took 67 taps.
 
-**Stopping merges the two lists.** While scanning, the screen alternates between
-the WiFi and BLE lists; while stopped there's no alternation to follow, so it
-shows one combined list instead, each row tagged `[BLE]` or `[WiFi]`. Previously
-the view froze on whichever band happened to be showing, and the other list was
-unreachable until you resumed.
+### Stopping = inspect mode
+
+Holding **A** to stop scanning does two things beyond freezing the list:
+
+- **It shows one device at a time, in full.** Instead of three compressed rows,
+  you get the complete record for a single device: untruncated MAC/BSSID, vendor,
+  tracker type, signal now *and* its min/max/average range, detection count, time
+  since first seen, and the persistence score against the threshold it needs to
+  beat. Tap **A** to step through devices one at a time.
+- **It merges the two lists.** While scanning, the screen alternates between the
+  WiFi and BLE lists; stopped, there's no alternation to follow, so both bands
+  appear in one list. Previously the view froze on whichever band happened to be
+  showing and the other was unreachable until you resumed.
+
+Any active filter still applies while stopped. This is where to read a MAC off
+the screen to write it down, and where to check whether a device's signal is
+holding steady (concerning) or drifting (usually not).
 
 ### Settings Menu
 ```

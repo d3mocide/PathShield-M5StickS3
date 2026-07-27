@@ -213,20 +213,36 @@ exposed.
   a page whose only job is one button. Added a description, favicon and OG tags
   so shared links preview as something; replaced the stale hardcoded "2024".
 
+## Phase 7 — Detail view and getting the render off the lock
+
+- [x] **Rendering no longer holds `deviceMutex`.** `displayTrackedDevices()` ran
+  start to finish with the mutex held, including every SPI write to the panel,
+  while `scanTask` on Core 0 needs that same mutex to record what it just
+  scanned and gives up after 2000ms — so a slow frame could make an entire scan
+  batch get silently discarded. The frame is now built in two halves: a
+  `FrameSnapshot` of just the rows about to be drawn, copied under the lock,
+  then rendering from that copy with no lock held. Invisible on screen; the
+  point is that updating the display no longer costs detections.
+- [x] **The per-frame sort only orders what's visible.** The bubble sort over
+  every tracked device (~2,400 comparisons at 70 devices, re-run every frame
+  inside the lock above) is now a `std::partial_sort` over just the window being
+  displayed. Same ordering, a fraction of the work, and what remains happens in
+  the short snapshot phase rather than across the whole draw.
+- [x] **Stopping the scan is now a per-device detail view.** All four gestures
+  were already assigned in both scanning and paused modes, so there was no
+  button left to open a detail view with. Rather than overload one — Phase 4
+  already established that hidden gestures on this device don't get found —
+  stopping now means "inspect": one device per screen with the untruncated
+  MAC/BSSID, vendor, tracker type, signal now plus its min/max/average range,
+  detection count, time since first seen, and the persistence score against the
+  threshold it has to beat. Tap A steps through devices, so scrolling is
+  unchanged in feel; there's just one device per step. Filters still apply.
+  Trade-off accepted: you no longer get a frozen three-row overview, on the
+  grounds that a frozen list is a weaker use of the screen than a full record
+  of one device — and the list is still there while scanning.
+
 ### Still open
 
-- [ ] **Per-device detail view.** Wanted, but every gesture is assigned in both
-  scanning and paused modes, so it needs either a repurposed button, a menu row
-  (the precedent Phase 4 set when it moved allowlisting off a hidden gesture),
-  or a change to what "paused" means. Under discussion.
-- [ ] **Move rendering out from under `deviceMutex`.** `displayTrackedDevices()`
-  holds the mutex across every SPI write. `scanTask` needs the same mutex to
-  record results and gives up after 2000ms, so a slow frame can make an entire
-  scan batch get dropped. Fix is to copy the ≤3 visible rows under the lock,
-  release, then draw. The O(n²) per-frame bubble sort (~2,400 comparisons at 70
-  devices, re-run every frame inside that same lock) is the same problem and
-  should be made incremental at the same time — it matters mainly because of
-  how long it holds the lock.
 - [ ] **IMU-based motion correlation.** Carried over from Phase 3.
 
 ## Already completed (context, not part of this roadmap's phases)
